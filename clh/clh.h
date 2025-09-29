@@ -29,16 +29,16 @@ typedef struct {
 } CLH_AMHandlerData;
 
 struct CLH_HandleData {
-    CLH_PMI_Handle     pmi;
-    ucp_context_h      ucp_context;
-    ucp_worker_h       worker;
-    CLH_Address        address;
-    ucp_ep_h          *endpoints;
-    CLH_BufferCache   *buffer_cache;
-    bool               run_progress;
-    CLH_Thread         progress_thread;
-    CLH_Mutex          mutex;
-    CLH_AMHandlerData  am_handlers_datas[32];
+    CLH_PMI_Handle    pmi;
+    ucp_context_h     ucp_context;
+    ucp_worker_h      worker;
+    CLH_Address       address;
+    ucp_ep_h         *endpoints;
+    CLH_BufferCache  *buffer_cache;
+    bool              run_progress;
+    CLH_Thread        progress_thread;
+    CLH_Mutex         mutex;
+    CLH_AMHandlerData am_handlers_datas[32];
 };
 
 typedef struct CLH_HandleData *CLH_Handle;
@@ -71,8 +71,9 @@ void        clh_request_destroy(CLH_Request *request);
 size_t      clh_request_buffer_len(CLH_Request const *request);
 clh_u64     clh_request_tag(CLH_Request const *request);
 
-clh_u32 clh_progress_one(CLH_Handle handle);
-void    clh_progress_all(CLH_Handle handle);
+clh_u32    clh_progress_one(CLH_Handle handle);
+void       clh_progress_all(CLH_Handle handle);
+CLH_Status clh_progress_signal(CLH_Handle handle);
 
 void clh_barrier(CLH_Handle handle);
 

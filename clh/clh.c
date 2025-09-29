@@ -42,6 +42,63 @@ static void failure_handler(void *request, ucp_ep_h ep, ucs_status_t status)
 }
 
 /******************************************************************************/
+/*                           progressing the worker                           */
+/******************************************************************************/
+
+/*
+ * This function is used in a thread and is in charge of progressing the workers.
+ */
+static void *progress(void *arg) {
+    CLH_Handle handle = (CLH_Handle)arg;
+
+    while (handle->run_progress) {
+        clh_mutex_lock(&handle->mutex);
+        while (ucp_worker_progress(handle->worker) > 0);
+        clh_mutex_unlock(&handle->mutex);
+        ucp_worker_wait(handle->worker);
+    }
+    return 0;
+}
+
+static void start_progress(CLH_Handle handle)
+{
+    handle->run_progress = true;
+    handle->progress_thread = clh_thread_spawn(&progress, handle);
+}
+
+static void terminate_progress(CLH_Handle handle)
+{
+    handle->run_progress = false;
+    ucp_worker_signal(handle->worker);
+    clh_thread_join(handle->progress_thread);
+}
+
+CLH_Status clh_progress_signal(CLH_Handle handle)
+{
+    if (!check_ucx(ucp_worker_signal(handle->worker))){
+        return CLH_STATUS_ERROR;
+    }
+    return CLH_STATUS_SUCCESS;
+}
+
+clh_u32 clh_progress_one(CLH_Handle handle)
+{
+    clh_u32 result = 0;
+
+    clh_mutex_lock(&handle->mutex);
+    result = ucp_worker_progress(handle->worker);
+    clh_mutex_unlock(&handle->mutex);
+    return result;
+}
+
+void clh_progress_all(CLH_Handle handle)
+{
+    clh_mutex_lock(&handle->mutex);
+    while (ucp_worker_progress(handle->worker) > 0);
+    clh_mutex_unlock(&handle->mutex);
+}
+
+/******************************************************************************/
 /*                              init / finalize                               */
 /******************************************************************************/
 
@@ -125,18 +182,6 @@ static inline CLH_Status init_cache_(CLH_Handle handle)
     return CLH_STATUS_SUCCESS;
 }
 
-/*
- * This function is used in a thread and is in charge of progressing the workers.
- */
-static void *progress(void *arg) {
-    CLH_Handle handle = (CLH_Handle)arg;
-
-    while (handle->run_progress) {
-        clh_progress_all(handle);
-    }
-    return 0;
-}
-
 CLH_Status clh_init(CLH_Handle *handle)
 {
     *handle = malloc(sizeof(struct CLH_HandleData));
@@ -156,10 +201,8 @@ CLH_Status clh_init(CLH_Handle *handle)
     if ((status = init_cache_(*handle)) != CLH_STATUS_SUCCESS) {
         return status;
     }
-    // progress is done in the communicator task
-    // (*handle)->run_progress = true;
-    // (*handle)->progress_thread = clh_thread_spawn(&progress, *handle);
     (*handle)->mutex = clh_mutex_create();
+    start_progress(*handle);
     return status;
 }
 
@@ -187,8 +230,7 @@ CLH_Status clh_finalize(CLH_Handle handle)
         clh_wait(handle, &(CLH_Request){.status = status_ptr});
     }
     free(handle->endpoints);
-    // handle->run_progress = false;
-    // clh_thread_join(handle->progress_thread);
+    terminate_progress(handle);
     ucp_worker_release_address(handle->worker, handle->address.data);
     ucp_worker_destroy(handle->worker);
     ucp_cleanup(handle->ucp_context);
@@ -329,23 +371,6 @@ bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *re
 /******************************************************************************/
 /*                                  requests                                  */
 /******************************************************************************/
-
-clh_u32 clh_progress_one(CLH_Handle handle)
-{
-    clh_u32 result = 0;
-
-    clh_mutex_lock(&handle->mutex);
-    result = ucp_worker_progress(handle->worker);
-    clh_mutex_unlock(&handle->mutex);
-    return result;
-}
-
-void clh_progress_all(CLH_Handle handle)
-{
-    clh_mutex_lock(&handle->mutex);
-    while (ucp_worker_progress(handle->worker) > 0);
-    clh_mutex_unlock(&handle->mutex);
-}
 
 CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request)
 {
