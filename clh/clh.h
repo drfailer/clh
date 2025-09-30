@@ -16,10 +16,12 @@ typedef struct {
     size_t         len;
 } CLH_Address;
 
-typedef struct {
-    ucs_status_ptr_t   *status;
+struct CLH_Request_ {
+    bool                completed;
     ucp_tag_recv_info_t tag_recv_info;
-} CLH_Request;
+};
+
+typedef struct CLH_Request_ *CLH_Request;
 
 typedef bool (*CLH_AMHandler)(void *arg, CLH_Buffer header, CLH_Buffer buf);
 
@@ -28,6 +30,21 @@ typedef struct {
     void         *user_callback_args;
 } CLH_AMHandlerData;
 
+typedef struct {
+    CLH_Buffer        buffer;
+    clh_u64           tag;
+    clh_u64           tag_mask;
+    clh_u32           node_id;
+    ucs_status_ptr_t *status_ptr;
+    CLH_Request       request;
+} CLH_Op;
+
+typedef struct {
+    CLH_Op *ptr;
+    size_t  len;
+    size_t  cap;
+} CLH_Ops;
+
 struct CLH_HandleData {
     CLH_PMI_Handle    pmi;
     ucp_context_h     ucp_context;
@@ -35,10 +52,12 @@ struct CLH_HandleData {
     CLH_Address       address;
     ucp_ep_h         *endpoints;
     CLH_BufferCache  *buffer_cache;
-    bool              run_progress;
-    CLH_Thread        progress_thread;
+    bool              run;
+    CLH_Thread        run_thread;
     CLH_Mutex         mutex;
     CLH_AMHandlerData am_handlers_datas[32];
+    CLH_Ops           send_queue;
+    CLH_Ops           recv_queue;
 };
 
 typedef struct CLH_HandleData *CLH_Handle;
@@ -57,23 +76,19 @@ CLH_Status clh_init(CLH_Handle *handle);
 CLH_Status clh_finalize(CLH_Handle handle);
 
 CLH_Status clh_send(CLH_Handle handle, clh_u32 node_id, clh_u64 tag, CLH_Buffer buf,
-                    CLH_Request *request);
+                    CLH_Request request);
 CLH_Status clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buf,
-                    CLH_Request *request);
+                    CLH_Request request);
 
-bool       clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *request);
-CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request);
-void       clh_cancel(CLH_Handle handle, CLH_Request *request);
+bool       clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request request);
+CLH_Status clh_wait(CLH_Handle handle, CLH_Request request);
+void       clh_cancel(CLH_Handle handle, CLH_Request request);
 
-bool        clh_request_completed(CLH_Handle handle, CLH_Request const *request);
+bool        clh_request_completed(CLH_Handle handle, CLH_Request request);
 CLH_Request clh_request_create();
-void        clh_request_destroy(CLH_Request *request);
-size_t      clh_request_buffer_len(CLH_Request const *request);
-clh_u64     clh_request_tag(CLH_Request const *request);
-
-clh_u32    clh_progress_one(CLH_Handle handle);
-void       clh_progress_all(CLH_Handle handle);
-CLH_Status clh_progress_signal(CLH_Handle handle);
+void        clh_request_destroy(CLH_Request request);
+size_t      clh_request_buffer_len(CLH_Request request);
+clh_u64     clh_request_tag(CLH_Request request);
 
 void clh_barrier(CLH_Handle handle);
 
