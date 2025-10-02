@@ -91,7 +91,7 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
         CLH_Op              *op = &queue->ptr[--queue->len];
         CLH_BufferCacheEntry bce
             = clh_buffer_cache_register_or_get(handle->buffer_cache, op->request->buffer);
-        if (bce.mem == NULL) {
+        if (bce.mem != op->request->buffer.mem) {
             clh_error("UCX", "%s", "registration error.");
             return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
         }
@@ -112,7 +112,7 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
         CLH_Op              *op = &queue->ptr[--queue->len];
         CLH_BufferCacheEntry bce
             = clh_buffer_cache_register_or_get(handle->buffer_cache, op->request->buffer);
-        if (bce.mem == NULL) {
+        if (bce.mem != op->request->buffer.mem) {
             clh_error("UCX", "%s", "registration error.");
             return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
         }
@@ -128,6 +128,7 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
     CLH_Ops *queue = &handle->probe_queue;
+
     while (queue->len > 0) {
         CLH_Op *op = &queue->ptr[--queue->len];
 
@@ -146,7 +147,9 @@ static CLH_Status process_request_queue_(CLH_Handle handle)
     size_t   idx = 0;
 
     while (idx < queue->len) {
-        CLH_Op      *op = &queue->ptr[idx];
+        CLH_Op *op = &queue->ptr[idx];
+
+        assert(UCS_PTR_IS_PTR(op->status_ptr) && !UCS_PTR_IS_ERR(op->status_ptr));
         ucs_status_t status = ucp_request_check_status(op->status_ptr);
 
         if (status == UCS_INPROGRESS) {
@@ -157,6 +160,7 @@ static CLH_Status process_request_queue_(CLH_Handle handle)
             array_remove(handle->process_queue, idx);
         } else {
             clh_error("UCX", "%s", "request error.");
+            array_remove(handle->process_queue, idx);
             return CLH_STATUS_ERROR;
         }
     }
