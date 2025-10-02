@@ -5,6 +5,7 @@
 #include "clh_defs.h"
 #include "pmi.h"
 #include "thread.h"
+#include "array.h"
 #include <ucp/api/ucp.h>
 
 #ifdef __cplusplus
@@ -16,9 +17,21 @@ typedef struct {
     size_t         len;
 } CLH_Address;
 
+typedef enum {
+    CLH_REQUEST_TYPE_SEND,
+    CLH_REQUEST_TYPE_RECV,
+    CLH_REQUEST_TYPE_PROBE,
+} CLH_RequestType;
+
 struct CLH_Request_ {
-    bool                completed;
+    CLH_RequestType     type;
+    volatile bool       completed;
+    CLH_Buffer          buffer;
+    clh_u64             tag;
+    clh_u64             tag_mask;
+    clh_u32             dest;
     ucp_tag_recv_info_t tag_recv_info;
+    bool                probe;
 };
 
 typedef struct CLH_Request_ *CLH_Request;
@@ -31,33 +44,26 @@ typedef struct {
 } CLH_AMHandlerData;
 
 typedef struct {
-    CLH_Buffer        buffer;
-    clh_u64           tag;
-    clh_u64           tag_mask;
-    clh_u32           node_id;
     ucs_status_ptr_t *status_ptr;
     CLH_Request       request;
 } CLH_Op;
 
-typedef struct {
-    CLH_Op *ptr;
-    size_t  len;
-    size_t  cap;
-} CLH_Ops;
+Array(CLH_Op) CLH_Ops;
 
 struct CLH_HandleData {
-    CLH_PMI_Handle    pmi;
-    ucp_context_h     ucp_context;
-    ucp_worker_h      worker;
-    CLH_Address       address;
-    ucp_ep_h         *endpoints;
-    CLH_BufferCache  *buffer_cache;
-    bool              run;
-    CLH_Thread        run_thread;
-    CLH_Mutex         mutex;
-    CLH_AMHandlerData am_handlers_datas[32];
-    CLH_Ops           send_queue;
-    CLH_Ops           recv_queue;
+    CLH_PMI_Handle   pmi;
+    ucp_context_h    ucp_context;
+    ucp_worker_h     worker;
+    CLH_Address      address;
+    ucp_ep_h        *endpoints;
+    CLH_BufferCache *buffer_cache;
+    bool             run;
+    CLH_Thread       run_thread;
+    CLH_Mutex        mutex;
+    CLH_Ops          send_queue;
+    CLH_Ops          recv_queue;
+    CLH_Ops          probe_queue;
+    CLH_Ops          process_queue;
 };
 
 typedef struct CLH_HandleData *CLH_Handle;

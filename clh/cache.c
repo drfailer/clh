@@ -25,7 +25,9 @@ bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node) {
     if (!free_tree_(cache, node->left)) {
         return false;
     }
-    return check_ucx(ucp_mem_unmap(cache->context, node->value.memh));
+    bool result = check_ucx(ucp_mem_unmap(cache->context, node->value.memh));
+    free(node);
+    return result;
 }
 
 bool clh_buffer_cache_destroy(CLH_BufferCache *cache)
