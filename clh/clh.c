@@ -1,6 +1,6 @@
 #include "clh.h"
 #include "pmi.h"
-#include "ucx_utils.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,17 +68,16 @@ static void ops_push(CLH_Ops *ops, CLH_Buffer buffer, clh_u64 tag, clh_u64 tag_m
     if (ops->len + 1 >= ops->cap) {
         assert(ops->cap > 0);
         ops->cap *= 2;
-        CLH_Op *tmp = malloc(ops->cap * sizeof(*ops->ptr));
-        memcpy(tmp, ops->ptr, ops->len * sizeof(*ops->ptr));
-        free(ops->ptr);
-        ops->ptr = tmp;
+        ops->ptr = realloc(ops->ptr, ops->cap * sizeof(*ops->ptr));
     }
-    ops->ptr[ops->len].buffer = buffer;
-    ops->ptr[ops->len].tag = tag;
-    ops->ptr[ops->len].tag_mask = tag_mask;
-    ops->ptr[ops->len].node_id = node_id;
-    ops->ptr[ops->len].request = request;
-    ops->ptr[ops->len].status_ptr = NULL;
+    ops->ptr[ops->len] = (CLH_Op) {
+        .buffer = buffer,
+        .tag = tag,
+        .tag_mask = tag_mask,
+        .node_id = node_id,
+        .request = request,
+        .status_ptr = NULL,
+    };
     ops->len += 1;
 }
 
@@ -92,12 +91,10 @@ static CLH_Op ops_pop(CLH_Ops *ops)
 
 static void ops_remove(CLH_Ops *ops, size_t idx)
 {
-    if (idx >= ops->len) {
+    if (ops->len == 0 || idx >= ops->len) {
         return;
     }
-    ops->len -= 1;
-    ops->ptr[idx] = ops->ptr[ops->len];
-    ops->ptr[ops->len].status_ptr = (void*)0xDEADBEEF;
+    ops->ptr[idx] = ops->ptr[--ops->len];
 }
 
 /******************************************************************************/
@@ -215,8 +212,8 @@ static void *run_(void *arg)
     CLH_Handle handle = (CLH_Handle)arg;
 
     while (handle->run || handle->send_queue.len > 0 || handle->recv_queue.len > 0) {
-        while (ucp_worker_progress(handle->worker) > 0);
         clh_mutex_lock(&handle->mutex);
+        while (ucp_worker_progress(handle->worker) > 0);
         process_send_queue_(handle);
         process_recv_queue_(handle);
         clh_mutex_unlock(&handle->mutex);
