@@ -70,41 +70,72 @@ static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request request, ucp_mem
                             request->tag_mask, &params);
 }
 
-static CLH_Status process_ops_queue_(CLH_Handle handle, CLH_Ops *queue)
+static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 {
+    if (UCS_PTR_IS_ERR(op->status_ptr)) {
+        return false;
+    }
+    if (!UCS_PTR_IS_PTR(op->status_ptr)) {
+        op->request->completed = true;
+    } else {
+        array_append(handle->process_queue, *op);
+    }
+    return true;
+}
+
+static CLH_Status process_send_queue_(CLH_Handle handle)
+{
+    CLH_Ops *queue = &handle->send_queue;
+
+    while (queue->len > 0) {
+        CLH_Op              *op = &queue->ptr[--queue->len];
+        CLH_BufferCacheEntry bce
+            = clh_buffer_cache_register_or_get(handle->buffer_cache, op->request->buffer);
+        if (bce.mem == NULL) {
+            clh_error("UCX", "%s", "registration error.");
+            return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
+        }
+        op->status_ptr = ucx_send(handle, op->request, bce.memh);
+        if (!validate_status_ptr_(handle, op)) {
+            clh_error("UCX", "%s", "send request failure.");
+            return CLH_STATUS_REQUEST_FAILURE;
+        }
+    }
+    return CLH_STATUS_SUCCESS;
+}
+
+static CLH_Status process_recv_queue_(CLH_Handle handle)
+{
+    CLH_Ops *queue = &handle->recv_queue;
+
+    while (queue->len > 0) {
+        CLH_Op              *op = &queue->ptr[--queue->len];
+        CLH_BufferCacheEntry bce
+            = clh_buffer_cache_register_or_get(handle->buffer_cache, op->request->buffer);
+        if (bce.mem == NULL) {
+            clh_error("UCX", "%s", "registration error.");
+            return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
+        }
+        op->status_ptr = ucx_recv(handle, op->request, bce.memh);
+        if (!validate_status_ptr_(handle, op)) {
+            clh_error("UCX", "%s", "recv request failure.");
+            return CLH_STATUS_REQUEST_FAILURE;
+        }
+    }
+    return CLH_STATUS_SUCCESS;
+}
+
+static CLH_Status process_probe_queue_(CLH_Handle handle)
+{
+    CLH_Ops *queue = &handle->probe_queue;
     while (queue->len > 0) {
         CLH_Op *op = &queue->ptr[--queue->len];
 
-        if (op->request->type == CLH_REQUEST_TYPE_PROBE) {
-            ucp_tag_message_h msg
-                = ucp_tag_probe_nb(handle->worker, op->request->tag, op->request->tag_mask, 0,
-                                   &op->request->tag_recv_info);
-            op->request->probe = msg != NULL;
-            op->request->completed = true;
-        } else {
-            CLH_BufferCacheEntry bce
-                = clh_buffer_cache_register_or_get(handle->buffer_cache, op->request->buffer);
-            if (bce.mem == NULL) {
-                clh_error("UCX", "%s", "registration error.");
-                return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-            }
-
-            if (op->request->type == CLH_REQUEST_TYPE_SEND) {
-                op->status_ptr = ucx_send(handle, op->request, bce.memh);
-            } else if (op->request->type == CLH_REQUEST_TYPE_RECV) {
-                op->status_ptr = ucx_recv(handle, op->request, bce.memh);
-            }
-
-            if (UCS_PTR_IS_ERR(op->status_ptr)) {
-                clh_error("UCX", "%s", "request failure.");
-                return CLH_STATUS_REQUEST_FAILURE;
-            }
-            if (!UCS_PTR_IS_PTR(op->status_ptr)) {
-                op->request->completed = true;
-            } else {
-                array_append(handle->process_queue, *op);
-            }
-        }
+        ucp_tag_message_h msg
+            = ucp_tag_probe_nb(handle->worker, op->request->tag, op->request->tag_mask, 0,
+                               &op->request->tag_recv_info);
+        op->request->probe = msg != NULL;
+        op->request->completed = true;
     }
     return CLH_STATUS_SUCCESS;
 }
@@ -135,18 +166,24 @@ static CLH_Status process_request_queue_(CLH_Handle handle)
 static CLH_Status process_shared_queues_(CLH_Handle handle)
 {
     clh_mutex_lock(&handle->mutex);
-    assert(process_ops_queue_(handle, &handle->send_queue) == CLH_STATUS_SUCCESS);
-    assert(process_ops_queue_(handle, &handle->recv_queue) == CLH_STATUS_SUCCESS);
-    assert(process_ops_queue_(handle, &handle->probe_queue) == CLH_STATUS_SUCCESS);
+    assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
+    assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
+    assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
     clh_mutex_unlock(&handle->mutex);
     return CLH_STATUS_SUCCESS;
+}
+
+static bool queues_emtpy_(CLH_Handle handle)
+{
+    return handle->send_queue.len == 0 && handle->recv_queue.len == 0
+           && handle->probe_queue.len == 0 && handle->process_queue.len == 0;
 }
 
 static void *run_(void *arg)
 {
     CLH_Handle handle = (CLH_Handle)arg;
 
-    while (handle->run || handle->send_queue.len > 0 || handle->recv_queue.len > 0) {
+    while (handle->run || !queues_emtpy_(handle)) {
         process_shared_queues_(handle);
         while (ucp_worker_progress(handle->worker) > 0)
             ;
@@ -379,7 +416,7 @@ CLH_Status clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer
     request->tag = tag;
     request->tag_mask = tag_mask;
     clh_mutex_lock(&handle->mutex);
-    array_append(handle->send_queue, (CLH_Op){.request = request});
+    array_append(handle->recv_queue, (CLH_Op){.request = request});
     clh_mutex_unlock(&handle->mutex);
     return CLH_STATUS_SUCCESS;
 }
@@ -390,9 +427,10 @@ bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request req
     request->tag = tag;
     request->tag_mask = tag_mask;
     clh_mutex_lock(&handle->mutex);
-    array_append(handle->send_queue, (CLH_Op){.request = request});
+    array_append(handle->probe_queue, (CLH_Op){.request = request});
     clh_mutex_unlock(&handle->mutex);
-    while (!request->completed);
+    while (!request->completed)
+        ;
     return request->probe;
 }
 
