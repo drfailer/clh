@@ -75,9 +75,6 @@ struct CLH_HandleData {
     CLH_Mutex        mutex;
     // contains the request queues for all the types
     CLH_RequestQueue request_queues[CLH_NUMBER_REQUEST_TYPES];
-    CLH_Ops          send_queue;
-    CLH_Ops          recv_queue;
-    CLH_Ops          probe_queue;
     CLH_Ops          process_queue;
 };
 
