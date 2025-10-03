@@ -98,17 +98,17 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
             clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem, op.request->buffer.mem);
             clh_error("UCX", "%s", "registration error (send).");
             status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-            goto unlock_and_exit;
+            goto unlock_and_return;
         }
         op.status_ptr = ucx_send(handle, op.request, bce.memh);
         if (!validate_status_ptr_(handle, &op)) {
             clh_error("UCX", "%s", "send request failure (send).");
             status = CLH_STATUS_REQUEST_FAILURE;
-            goto unlock_and_exit;
+            goto unlock_and_return;
         }
     }
     queue->len = 0;
-unlock_and_exit:
+unlock_and_return:
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     return status;
 }
@@ -128,17 +128,17 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
             clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem, op.request->buffer.mem);
             clh_error("UCX", "%s", "registration error (recv).");
             status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-            goto unlock_and_exit;
+            goto unlock_and_return;
         }
         op.status_ptr = ucx_recv(handle, op.request, bce.memh);
         if (!validate_status_ptr_(handle, &op)) {
             clh_error("UCX", "%s", "recv request failure (recv).");
             status = CLH_STATUS_REQUEST_FAILURE;
-            goto unlock_and_exit;
+            goto unlock_and_return;
         }
     }
     queue->len = 0;
-unlock_and_exit:
+unlock_and_return:
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     return status;
 }
