@@ -2,6 +2,7 @@
 #include "log.h"
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 CLH_BufferCache *clh_buffer_cache_create(ucp_context_h context, size_t)
 {
@@ -32,6 +33,7 @@ bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node) {
 
 bool clh_buffer_cache_destroy(CLH_BufferCache *cache)
 {
+    clh_mutex_destroy(&cache->mutex);
     free_tree_(cache, cache->data);
     free(cache);
     return true;
@@ -47,6 +49,7 @@ static CLH_BufferCacheNode **buffer_cache_search_(CLH_BufferCache *cache, CLH_Bu
         } else if (buffer.mem > (*cur)->value.mem) {
             cur = &(*cur)->right;
         } else {
+            assert(buffer.mem == (*cur)->value.mem);
             return cur;
         }
     }
@@ -79,11 +82,14 @@ CLH_BufferCacheEntry clh_buffer_cache_register_or_get(CLH_BufferCache *cache, CL
             (*node)->value.mem = buffer.mem;
             (*node)->value.memh = memh;
             result = (*node)->value;
+            assert(result.mem == buffer.mem);
         }
     } else {
         result = (*node)->value;
+        assert(result.mem == buffer.mem);
     }
     clh_mutex_unlock(&cache->mutex);
+    assert(result.mem == buffer.mem);
     return result;
 }
 
