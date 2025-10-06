@@ -22,13 +22,29 @@ typedef enum {
 typedef struct {
     CLH_RequestType     type;
     volatile bool       completed;
+    bool                probe;
     CLH_Buffer          buffer;
     clh_u64             tag;
     clh_u64             tag_mask;
     clh_u32             dest;
     ucp_tag_recv_info_t tag_recv_info;
-    bool                probe;
 } CLH_Request;
+
+Array(CLH_Request*) CLH_RequestArray;
+typedef struct {
+    CLH_Mutex mutex;
+    CLH_RequestArray requests;
+} CLH_RequestQueue;
+
+struct CLH_RequestPoolNode {
+    CLH_Request request;
+    struct CLH_RequestPoolNode *next;
+};
+
+typedef struct {
+    struct CLH_RequestPoolNode *used_nodes;
+    struct CLH_RequestPoolNode *free_nodes;
+} CLH_RequestPool;
 
 typedef struct {
     ucp_address_t *data;
@@ -50,12 +66,6 @@ typedef struct {
 
 Array(CLH_Op) CLH_Ops;
 
-Array(CLH_Request*) CLH_RequestArray;
-typedef struct {
-    CLH_Mutex mutex;
-    CLH_RequestArray requests;
-} CLH_RequestQueue;
-
 // TODO:
 // - write a request pool that will contain two lists (request allocation):
 //   - free list
@@ -73,9 +83,9 @@ struct CLH_HandleData {
     bool             run;
     CLH_Thread       run_thread;
     CLH_Mutex        mutex;
-    // contains the request queues for all the types
     CLH_RequestQueue request_queues[CLH_NUMBER_REQUEST_TYPES];
     CLH_Ops          process_queue;
+    CLH_RequestPool  request_pool;
 };
 
 typedef struct CLH_HandleData *CLH_Handle;
@@ -102,8 +112,8 @@ bool       clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Reque
 CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request);
 void       clh_cancel(CLH_Handle handle, CLH_Request *request);
 
-CLH_Request *clh_request_create();
-void        clh_request_destroy(CLH_Request *request);
+CLH_Request *clh_request_create(CLH_Handle handle);
+void        clh_request_destroy(CLH_Handle handle, CLH_Request *request);
 
 bool        clh_request_completed(CLH_Handle handle, CLH_Request *request);
 size_t      clh_request_buffer_len(CLH_Request *request);
