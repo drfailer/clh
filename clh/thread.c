@@ -34,3 +34,30 @@ void clh_mutex_unlock(CLH_Mutex *mutex)
 {
     pthread_mutex_unlock(mutex);
 }
+
+CLH_ConditionalVariable clh_conditional_variable_create()
+{
+    CLH_ConditionalVariable cv;
+    pthread_cond_init(&cv, NULL);
+    return cv;
+}
+
+void clh_conditional_variable_destroy(CLH_ConditionalVariable *cv)
+{
+    pthread_cond_destroy(cv);
+}
+
+void clh_conditional_variable_wait(CLH_ConditionalVariable *cv, CLH_Mutex *mutex)
+{
+    pthread_cond_wait(cv, mutex);
+}
+
+void clh_conditional_variable_notify_one(CLH_ConditionalVariable *cv)
+{
+    pthread_cond_signal(cv);
+}
+
+void clh_conditional_variable_notify_all(CLH_ConditionalVariable *cv)
+{
+    pthread_cond_broadcast(cv);
+}
