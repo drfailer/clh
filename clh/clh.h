@@ -42,6 +42,7 @@ struct CLH_RequestPoolNode {
 };
 
 typedef struct {
+    CLH_Mutex mutex;
     struct CLH_RequestPoolNode *used_nodes;
     struct CLH_RequestPoolNode *free_nodes;
 } CLH_RequestPool;

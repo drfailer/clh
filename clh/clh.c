@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /******************************************************************************/
 /*                                   status                                   */
@@ -85,7 +86,7 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 
 static CLH_Status process_send_queue_(CLH_Handle handle)
 {
-    CLH_Status status = CLH_STATUS_SUCCESS;
+    CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
 
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
@@ -115,7 +116,7 @@ unlock_and_return:
 
 static CLH_Status process_recv_queue_(CLH_Handle handle)
 {
-    CLH_Status status = CLH_STATUS_SUCCESS;
+    CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
 
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
@@ -145,7 +146,7 @@ unlock_and_return:
 
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
-    CLH_Status status = CLH_STATUS_SUCCESS;
+    CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
 
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
@@ -275,7 +276,9 @@ static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
 {
     ucp_worker_params_t worker_params = {
         .field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
-        .thread_mode = UCS_THREAD_MODE_SERIALIZED,
+        // .thread_mode = UCS_THREAD_MODE_SINGLE,
+        // .thread_mode = UCS_THREAD_MODE_SERIALIZED,
+        .thread_mode = UCS_THREAD_MODE_MULTI,
     };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
         return CLH_STATUS_ERROR;
@@ -351,7 +354,8 @@ CLH_Status clh_init(CLH_Handle *handle)
         return status;
     }
     (*handle)->mutex = clh_mutex_create();
-    (*handle)->request_pool = (CLH_RequestPool){ NULL, NULL }; // prealloc???
+    (*handle)->request_pool.mutex = clh_mutex_create();
+    (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
     start_(*handle);
     return status;
 }
@@ -417,6 +421,7 @@ CLH_Status clh_finalize(CLH_Handle handle)
     ucp_cleanup(handle->ucp_context);
     clh_pmi_finalize(handle->pmi);
     clh_mutex_destroy(&handle->mutex);
+    clh_mutex_destroy(&handle->request_pool.mutex);
     for (struct CLH_RequestPoolNode *node = handle->request_pool.free_nodes; node != NULL;) {
         struct CLH_RequestPoolNode *next = node->next;
         free(node);
@@ -438,8 +443,8 @@ CLH_Status clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buf
                     CLH_Request *request)
 {
     request->type = CLH_REQUEST_TYPE_SEND;
-    request->buffer = buffer;
     request->completed = false;
+    request->buffer = buffer;
     request->tag = tag;
     request->dest = dest;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
@@ -452,8 +457,8 @@ CLH_Status clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer
                     CLH_Request *request)
 {
     request->type = CLH_REQUEST_TYPE_RECV;
-    request->buffer = buffer;
     request->completed = false;
+    request->buffer = buffer;
     request->tag = tag;
     request->tag_mask = tag_mask;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
@@ -466,6 +471,7 @@ bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *re
 {
     request->type = CLH_REQUEST_TYPE_PROBE;
     request->completed = false;
+    request->probe = false;
     request->tag = tag;
     request->tag_mask = tag_mask;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
@@ -480,16 +486,10 @@ bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *re
 /*                                  requests                                  */
 /******************************************************************************/
 
-CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request)
+CLH_Status clh_wait(CLH_Handle, CLH_Request *request)
 {
-    bool wait = true;
-
-    while (wait) {
-        clh_mutex_lock(&handle->mutex);
-        if (request->completed) {
-            wait = false;
-        }
-        clh_mutex_unlock(&handle->mutex);
+    while (!request->completed) {
+        usleep(1);
     }
     return CLH_STATUS_SUCCESS;
 }
@@ -522,28 +522,25 @@ CLH_Request *clh_request_create(CLH_Handle handle)
 {
     struct CLH_RequestPoolNode *node = NULL;
 
-    clh_mutex_lock(&handle->mutex);
+    clh_mutex_lock(&handle->request_pool.mutex);
     if (handle->request_pool.free_nodes != NULL) {
         node = handle->request_pool.free_nodes;
         handle->request_pool.free_nodes = node->next;
     } else {
         node = calloc(1, sizeof(*node));
     }
-    // node->next = handle->request_pool.used_nodes;
-    // handle->request_pool.used_nodes = node;
-    node->next = NULL;
-    clh_mutex_unlock(&handle->mutex);
-    assert((CLH_Request*)node == &node->request);
-    return (CLH_Request*)node;
+    clh_mutex_unlock(&handle->request_pool.mutex);
+    assert((CLH_Request *)node == &node->request);
+    return (CLH_Request *)node;
 }
 
 void clh_request_destroy(CLH_Handle handle, CLH_Request *request)
 {
-    clh_mutex_lock(&handle->mutex);
+    clh_mutex_lock(&handle->request_pool.mutex);
     struct CLH_RequestPoolNode *node = (struct CLH_RequestPoolNode *)request;
     node->next = handle->request_pool.free_nodes;
     handle->request_pool.free_nodes = node;
-    clh_mutex_unlock(&handle->mutex);
+    clh_mutex_unlock(&handle->request_pool.mutex);
 }
 
 size_t clh_request_buffer_len(CLH_Request *request)
