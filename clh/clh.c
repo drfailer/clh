@@ -49,14 +49,23 @@ static void failure_handler(void *request, ucp_ep_h ep, ucs_status_t status)
 /*                                    run                                     */
 /******************************************************************************/
 
+#define complete_request_(request, ...)                    \
+    do {                                                   \
+        clh_mutex_lock(&request->mutex);                   \
+        {__VA_ARGS__} request->completed = true;           \
+        clh_conditional_variable_notify_one(&request->cv); \
+        clh_mutex_unlock(&request->mutex);                 \
+    } while (false);
+
 static ucs_status_ptr_t ucx_send(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
 {
     ucp_request_param_t params = {
         .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
         .memh = memh,
     };
-    return ucp_tag_send_nbx(handle->endpoints[request->dest], request->buffer.mem,
-                            request->buffer.len, request->tag, &params);
+    return ucp_tag_send_nbx(handle->endpoints[request->data.send.dest],
+                            request->data.send.buffer.mem, request->data.send.buffer.len,
+                            request->data.send.tag, &params);
 }
 
 static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
@@ -67,8 +76,18 @@ static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_me
         .datatype = ucp_dt_make_contig(1),
         .memh = memh,
     };
-    return ucp_tag_recv_nbx(handle->worker, request->buffer.mem, request->buffer.len, request->tag,
-                            request->tag_mask, &params);
+    ucs_status_ptr_t status;
+
+    if (request->data.recv.msg != NULL) {
+        status
+            = ucp_tag_msg_recv_nbx(handle->worker, request->data.recv.buffer.mem,
+                                   request->data.recv.buffer.len, request->data.recv.msg, &params);
+    } else {
+        status = ucp_tag_recv_nbx(handle->worker, request->data.recv.buffer.mem,
+                                  request->data.recv.buffer.len, request->data.recv.tag,
+                                  request->data.recv.tag_mask, &params);
+    }
+    return status;
 }
 
 static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
@@ -77,7 +96,7 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
         return false;
     }
     if (!UCS_PTR_IS_PTR(op->status_ptr)) {
-        op->request->completed = true;
+        complete_request_(op->request);
     } else {
         array_append(handle->process_queue, *op);
     }
@@ -94,9 +113,10 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
     for (size_t i = 0; i < queue->len; ++i) {
         CLH_Op               op = {.request = queue->ptr[i], .status_ptr = NULL};
         CLH_BufferCacheEntry bce
-            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->buffer);
-        if (bce.mem != op.request->buffer.mem) {
-            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem, op.request->buffer.mem);
+            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->data.send.buffer);
+        if (bce.mem != op.request->data.send.buffer.mem) {
+            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                     op.request->data.send.buffer.mem);
             clh_error("UCX", "%s", "registration error (send).");
             status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
             goto unlock_and_return;
@@ -124,9 +144,10 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
     for (size_t i = 0; i < queue->len; ++i) {
         CLH_Op               op = {.request = queue->ptr[i], .status_ptr = NULL};
         CLH_BufferCacheEntry bce
-            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->buffer);
-        if (bce.mem != op.request->buffer.mem) {
-            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem, op.request->buffer.mem);
+            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->data.recv.buffer);
+        if (bce.mem != op.request->data.recv.buffer.mem) {
+            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                     op.request->data.recv.buffer.mem);
             clh_error("UCX", "%s", "registration error (recv).");
             status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
             goto unlock_and_return;
@@ -152,12 +173,18 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
     queue = &handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests;
     for (size_t i = 0; i < queue->len; ++i) {
-        CLH_Request *request = queue->ptr[i];
+        CLH_Request        *request = queue->ptr[i];
+        ucp_tag_recv_info_t infos;
+        ucp_tag_message_h   msg;
 
-        ucp_tag_message_h msg = ucp_tag_probe_nb(handle->worker, request->tag, request->tag_mask, 0,
-                                                 &request->tag_recv_info);
-        request->probe = msg != NULL;
-        request->completed = true;
+        msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
+                               request->data.probe.tag_mask, request->data.probe.remove, &infos);
+        complete_request_(request, {
+            request->data.probe.result = (msg != NULL);
+            request->data.probe.buffer_len = infos.length;
+            request->data.probe.sender_tag = infos.sender_tag;
+            request->data.probe.msg = msg;
+        });
     }
     queue->len = 0;
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
@@ -178,10 +205,10 @@ static CLH_Status process_request_queue_(CLH_Handle handle)
         if (status == UCS_INPROGRESS) {
             idx += 1;
         } else if (status == UCS_OK) {
-            volatile CLH_Request *request = op->request;
+            CLH_Request *request = op->request;
             ucp_request_free(op->status_ptr);
             array_remove(handle->process_queue, idx);
-            request->completed = true;
+            complete_request_(request);
         } else {
             clh_error("UCX", "%s", "request error.");
             array_remove(handle->process_queue, idx);
@@ -424,7 +451,7 @@ CLH_Status clh_finalize(CLH_Handle handle)
     clh_mutex_destroy(&handle->request_pool.mutex);
     for (struct CLH_RequestPoolNode *node = handle->request_pool.free_nodes; node != NULL;) {
         struct CLH_RequestPoolNode *next = node->next;
-        free(node);
+        clh_request_pool_node_destroy(node);
         node = next;
     }
     free(handle);
@@ -439,47 +466,68 @@ CLH_Status clh_finalize(CLH_Handle handle)
 /*                          communication functions                           */
 /******************************************************************************/
 
-CLH_Status clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buffer,
-                    CLH_Request *request)
+CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buffer)
 {
+    CLH_Request *request = clh_request_get(handle);
     request->type = CLH_REQUEST_TYPE_SEND;
     request->completed = false;
-    request->buffer = buffer;
-    request->tag = tag;
-    request->dest = dest;
+    request->data.send.buffer = buffer;
+    request->data.send.tag = tag;
+    request->data.send.dest = dest;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
-    return CLH_STATUS_SUCCESS;
+    return request;
 }
 
-CLH_Status clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buffer,
-                    CLH_Request *request)
+CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buffer)
 {
+    CLH_Request *request = clh_request_get(handle);
     request->type = CLH_REQUEST_TYPE_RECV;
     request->completed = false;
-    request->buffer = buffer;
-    request->tag = tag;
-    request->tag_mask = tag_mask;
+    request->data.recv.buffer = buffer;
+    request->data.recv.tag = tag;
+    request->data.recv.tag_mask = tag_mask;
+    request->data.recv.msg = NULL;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
-    return CLH_STATUS_SUCCESS;
+    return request;
 }
 
-bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *request)
+CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffer buffer)
 {
+    clh_u64 tag = request->data.probe.sender_tag;
+    bool remove = request->data.probe.remove;
+    ucp_tag_message_h msg = request->data.probe.msg;
+
+    request->type = CLH_REQUEST_TYPE_RECV;
+    request->completed = false;
+    request->data.recv.buffer = buffer;
+    request->data.recv.tag = tag;
+    request->data.recv.tag_mask = 0xFFFFFFFFFFFFFFFF;
+    request->data.recv.msg = remove ? msg : NULL;
+    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
+    array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
+    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
+    return request;
+}
+
+CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove)
+{
+    CLH_Request *request = clh_request_get(handle);
     request->type = CLH_REQUEST_TYPE_PROBE;
     request->completed = false;
-    request->probe = false;
-    request->tag = tag;
-    request->tag_mask = tag_mask;
+    request->data.probe.result = false;
+    request->data.probe.remove = remove;
+    request->data.probe.tag = tag;
+    request->data.probe.tag_mask = tag_mask;
+    request->data.probe.msg = NULL;
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-    while (!request->completed)
-        ;
-    return request->probe;
+    clh_wait(handle, request);
+    return request;
 }
 
 /******************************************************************************/
@@ -488,9 +536,11 @@ bool clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *re
 
 CLH_Status clh_wait(CLH_Handle, CLH_Request *request)
 {
+    clh_mutex_lock(&request->mutex);
     while (!request->completed) {
-        usleep(1);
+        clh_conditional_variable_wait(&request->cv, &request->mutex);
     }
+    clh_mutex_unlock(&request->mutex);
     return CLH_STATUS_SUCCESS;
 }
 
@@ -515,10 +565,29 @@ bool clh_ucx_request_completed_(CLH_Handle handle, ucs_status_ptr_t status_ptr)
 
 bool clh_request_completed(CLH_Handle, CLH_Request *request)
 {
-    return request->completed;
+    clh_mutex_lock(&request->mutex);
+    bool result = request->completed;
+    clh_mutex_unlock(&request->mutex);
+    return result;
 }
 
-CLH_Request *clh_request_create(CLH_Handle handle)
+struct CLH_RequestPoolNode *clh_request_pool_node_create()
+{
+    struct CLH_RequestPoolNode *node = malloc(sizeof(*node));
+    assert((CLH_Request *)node == &node->request);
+    node->request.mutex = clh_mutex_create();
+    node->request.cv = clh_conditional_variable_create();
+    return node;
+}
+
+void clh_request_pool_node_destroy(struct CLH_RequestPoolNode *node)
+{
+    clh_mutex_destroy(&node->request.mutex);
+    clh_conditional_variable_destroy(&node->request.cv);
+    free(node);
+}
+
+CLH_Request *clh_request_get(CLH_Handle handle)
 {
     struct CLH_RequestPoolNode *node = NULL;
 
@@ -527,14 +596,13 @@ CLH_Request *clh_request_create(CLH_Handle handle)
         node = handle->request_pool.free_nodes;
         handle->request_pool.free_nodes = node->next;
     } else {
-        node = calloc(1, sizeof(*node));
+        node = clh_request_pool_node_create();
     }
     clh_mutex_unlock(&handle->request_pool.mutex);
-    assert((CLH_Request *)node == &node->request);
     return (CLH_Request *)node;
 }
 
-void clh_request_destroy(CLH_Handle handle, CLH_Request *request)
+void clh_request_release(CLH_Handle handle, CLH_Request *request)
 {
     clh_mutex_lock(&handle->request_pool.mutex);
     struct CLH_RequestPoolNode *node = (struct CLH_RequestPoolNode *)request;
@@ -545,12 +613,12 @@ void clh_request_destroy(CLH_Handle handle, CLH_Request *request)
 
 size_t clh_request_buffer_len(CLH_Request *request)
 {
-    return request->tag_recv_info.length;
+    return request->data.probe.buffer_len;
 }
 
 clh_u64 clh_request_tag(CLH_Request *request)
 {
-    return request->tag_recv_info.sender_tag;
+    return request->data.probe.sender_tag;
 }
 
 /******************************************************************************/

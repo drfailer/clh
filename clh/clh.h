@@ -1,11 +1,11 @@
 #ifndef CLH
 #define CLH
+#include "array.h"
 #include "buffer.h"
 #include "cache.h"
 #include "clh_defs.h"
 #include "pmi.h"
 #include "thread.h"
-#include "array.h"
 #include <ucp/api/ucp.h>
 
 #ifdef __cplusplus
@@ -19,30 +19,49 @@ typedef enum {
 } CLH_RequestType;
 #define CLH_NUMBER_REQUEST_TYPES 3
 
+// TODO: one mutex + conditional variable per request + use union for clarity
 typedef struct {
-    CLH_RequestType     type;
-    volatile bool       completed;
-    bool                probe;
-    CLH_Buffer          buffer;
-    clh_u64             tag;
-    clh_u64             tag_mask;
-    clh_u32             dest;
-    ucp_tag_recv_info_t tag_recv_info;
+    CLH_RequestType         type;
+    bool                    completed;
+    CLH_Mutex               mutex;
+    CLH_ConditionalVariable cv;
+    union {
+        struct {
+            bool              result;
+            bool              remove;
+            clh_u64           tag;
+            clh_u64           tag_mask;
+            size_t            buffer_len;
+            clh_u64           sender_tag;
+            ucp_tag_message_h msg;
+        } probe;
+        struct {
+            CLH_Buffer buffer;
+            clh_u64    tag;
+            clh_u32    dest;
+        } send;
+        struct {
+            CLH_Buffer        buffer;
+            clh_u64           tag;
+            clh_u64           tag_mask;
+            ucp_tag_message_h msg;
+        } recv;
+    } data;
 } CLH_Request;
 
-Array(CLH_Request*) CLH_RequestArray;
+Array(CLH_Request *) CLH_RequestArray;
 typedef struct {
-    CLH_Mutex mutex;
+    CLH_Mutex        mutex;
     CLH_RequestArray requests;
 } CLH_RequestQueue;
 
 struct CLH_RequestPoolNode {
-    CLH_Request request;
+    CLH_Request                 request;
     struct CLH_RequestPoolNode *next;
 };
 
 typedef struct {
-    CLH_Mutex mutex;
+    CLH_Mutex                   mutex;
     struct CLH_RequestPoolNode *used_nodes;
     struct CLH_RequestPoolNode *free_nodes;
 } CLH_RequestPool;
@@ -63,7 +82,6 @@ typedef struct {
     ucs_status_ptr_t *status_ptr;
     CLH_Request      *request;
 } CLH_Op;
-
 
 Array(CLH_Op) CLH_Ops;
 
@@ -104,23 +122,25 @@ char const *clh_status_string(CLH_Status status);
 CLH_Status clh_init(CLH_Handle *handle);
 CLH_Status clh_finalize(CLH_Handle handle);
 
-CLH_Status clh_send(CLH_Handle handle, clh_u32 node_id, clh_u64 tag, CLH_Buffer buf,
-                    CLH_Request *request);
-CLH_Status clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buf,
-                    CLH_Request *request);
+CLH_Request *clh_send(CLH_Handle handle, clh_u32 node_id, clh_u64 tag, CLH_Buffer buf);
+CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buf);
+CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *probe_request, CLH_Buffer buf);
+CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove);
 
-bool       clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Request *request);
 CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request);
 void       clh_cancel(CLH_Handle handle, CLH_Request *request);
 
-CLH_Request *clh_request_create(CLH_Handle handle);
-void        clh_request_destroy(CLH_Handle handle, CLH_Request *request);
+struct CLH_RequestPoolNode *clh_request_pool_node_create();
+void                        clh_request_pool_node_destroy(struct CLH_RequestPoolNode *request);
 
-bool        clh_request_completed(CLH_Handle handle, CLH_Request *request);
-size_t      clh_request_buffer_len(CLH_Request *request);
-clh_u64     clh_request_tag(CLH_Request *request);
+CLH_Request *clh_request_get(CLH_Handle handle);
+void         clh_request_release(CLH_Handle handle, CLH_Request *request);
 
-void clh_barrier(CLH_Handle handle);
+bool    clh_request_completed(CLH_Handle handle, CLH_Request *request);
+size_t  clh_request_buffer_len(CLH_Request *request);
+clh_u64 clh_request_tag(CLH_Request *request);
+
+void    clh_barrier(CLH_Handle handle);
 clh_i32 clh_node_id(CLH_Handle handle);
 clh_u32 clh_nb_nodes(CLH_Handle handle);
 
