@@ -108,6 +108,10 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
     CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
 
+    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len == 0) {
+        return status;
+    }
+
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     queue = &handle->request_queues[CLH_REQUEST_TYPE_SEND].requests;
     for (size_t i = 0; i < queue->len; ++i) {
@@ -139,6 +143,10 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
     CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
 
+    if (handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len == 0) {
+        return status;
+    }
+
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     queue = &handle->request_queues[CLH_REQUEST_TYPE_RECV].requests;
     for (size_t i = 0; i < queue->len; ++i) {
@@ -169,6 +177,10 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
     CLH_Status        status = CLH_STATUS_SUCCESS;
     CLH_RequestArray *queue;
+
+    if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0) {
+        return status;
+    }
 
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
     queue = &handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests;
@@ -389,8 +401,6 @@ CLH_Status clh_init(CLH_Handle *handle)
 
 static CLH_Status clh_ucx_wait_(CLH_Handle handle, ucs_status_ptr_t status_ptr)
 {
-    CLH_Status result = CLH_STATUS_SUCCESS;
-
     if (UCS_PTR_IS_ERR(status_ptr)) {
         return CLH_STATUS_REQUEST_FAILURE;
     }
@@ -399,7 +409,6 @@ static CLH_Status clh_ucx_wait_(CLH_Handle handle, ucs_status_ptr_t status_ptr)
         return CLH_STATUS_SUCCESS;
     }
 
-    clh_mutex_lock(&handle->mutex);
     while (true) {
         ucs_status_t status = ucp_request_check_status(status_ptr);
 
@@ -408,14 +417,11 @@ static CLH_Status clh_ucx_wait_(CLH_Handle handle, ucs_status_ptr_t status_ptr)
         } else if (status == UCS_OK) {
             break;
         } else {
-            result = CLH_STATUS_REQUEST_FAILURE;
-            goto unlock_and_return;
+            return CLH_STATUS_REQUEST_FAILURE;
         }
     }
     ucp_request_free(status_ptr);
-unlock_and_return:
-    clh_mutex_unlock(&handle->mutex);
-    return result;
+    return CLH_STATUS_SUCCESS;
 }
 
 CLH_Status clh_finalize(CLH_Handle handle)
@@ -555,20 +561,9 @@ void clh_cancel(CLH_Handle, CLH_Request *)
     // clh_mutex_unlock(&handle->mutex);
 }
 
-bool clh_ucx_request_completed_(CLH_Handle handle, ucs_status_ptr_t status_ptr)
-{
-    clh_mutex_lock(&handle->mutex);
-    ucs_status_t status = ucp_request_check_status(status_ptr);
-    clh_mutex_unlock(&handle->mutex);
-    return status != UCS_INPROGRESS;
-}
-
 bool clh_request_completed(CLH_Handle, CLH_Request *request)
 {
-    clh_mutex_lock(&request->mutex);
-    bool result = request->completed;
-    clh_mutex_unlock(&request->mutex);
-    return result;
+    return request->completed;
 }
 
 struct CLH_RequestPoolNode *clh_request_pool_node_create()
