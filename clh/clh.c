@@ -304,8 +304,8 @@ static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
     ucp_worker_params_t worker_params = {
         .field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
         // .thread_mode = UCS_THREAD_MODE_SINGLE,
-        // .thread_mode = UCS_THREAD_MODE_SERIALIZED,
-        .thread_mode = UCS_THREAD_MODE_MULTI,
+        .thread_mode = UCS_THREAD_MODE_SERIALIZED,
+        // .thread_mode = UCS_THREAD_MODE_MULTI,
     };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
         return CLH_STATUS_ERROR;
@@ -497,8 +497,8 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
 
 CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffer buffer)
 {
-    clh_u64 tag = request->data.probe.sender_tag;
-    bool remove = request->data.probe.remove;
+    clh_u64           tag = request->data.probe.sender_tag;
+    bool              remove = request->data.probe.remove;
     ucp_tag_message_h msg = request->data.probe.msg;
 
     request->type = CLH_REQUEST_TYPE_RECV;
