@@ -7,6 +7,7 @@
 #include "pmi.h"
 #include "thread.h"
 #include <ucp/api/ucp.h>
+#include "clh_perf.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,6 +122,30 @@ struct CLH_HandleData {
     CLH_Ops          process_queue;
     CLH_RequestPool  request_pool;
     CLH_AMHandlerDataArray am_handlers_data;
+    struct {
+        struct {
+            CLH_Duration register_dur;
+            size_t register_count;
+        } cache;
+        struct {
+            CLH_Duration progress_dur;
+            size_t progress_count;
+            CLH_Duration process_shared_queues_dur;
+            size_t process_shared_queues_count;
+            CLH_Duration process_requests_dur;
+            size_t process_requests_count;
+        } run;
+        struct {
+            CLH_Duration send_dur;
+            size_t send_count;
+            CLH_Duration recv_dur;
+            size_t recv_count;
+            CLH_Duration probe_dur;
+            size_t probe_count;
+            CLH_Duration probe_wait_dur;
+            size_t probe_wait_count;
+        } comm;
+    } stats;
 };
 
 typedef enum {
