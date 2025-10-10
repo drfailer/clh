@@ -1,8 +1,65 @@
 #include "cache.h"
 #include "log.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+
+// #define CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
+
+/******************************************************************************/
+/*                           buffer cache allocator                           */
+/******************************************************************************/
+
+CLH_BufferCacheNodeAllocator buffer_cache_node_allocator_create(size_t block_size)
+{
+    CLH_BufferCacheNodeAllocatorBlock *block
+        = malloc(sizeof(*block) + block_size * sizeof(*block->mem));
+    block->next = NULL;
+    block->count = 0;
+    return (CLH_BufferCacheNodeAllocator){
+        .first_block = block,
+        .last_block = block,
+        .block_size = block_size,
+    };
+}
+
+CLH_BufferCacheNode *
+buffer_cache_node_allocator_create_node(CLH_BufferCacheNodeAllocator *allocator)
+{
+    CLH_BufferCacheNode *node = NULL;
+
+    if (allocator->last_block->count >= allocator->block_size) {
+        CLH_BufferCacheNodeAllocatorBlock *block
+            = malloc(sizeof(*block) + allocator->block_size * sizeof(*block->mem));
+        block->next = NULL;
+        block->count = 0;
+        allocator->last_block->next = block;
+        allocator->last_block = block;
+    }
+    node = &allocator->last_block->mem[allocator->last_block->count];
+    allocator->last_block->count += 1;
+    return node;
+}
+
+void buffer_cache_node_allocator_destroy(ucp_context_h                 ucp_ctx,
+                                         CLH_BufferCacheNodeAllocator *allocator)
+{
+    CLH_BufferCacheNodeAllocatorBlock *cur = allocator->first_block;
+
+    for (; cur != NULL;) {
+        CLH_BufferCacheNodeAllocatorBlock *block = cur;
+
+        cur = cur->next;
+        for (size_t i = 0; i < block->count; ++i) {
+            check_ucx(ucp_mem_unmap(ucp_ctx, block->mem[i].value.memh));
+        }
+        free(block);
+    }
+}
+
+/******************************************************************************/
+/*                                buffer cache                                */
+/******************************************************************************/
 
 CLH_BufferCache *clh_buffer_cache_create(ucp_context_h context, size_t)
 {
@@ -13,10 +70,12 @@ CLH_BufferCache *clh_buffer_cache_create(ucp_context_h context, size_t)
     cache->data = NULL;
     cache->size = 0;
     cache->mutex = clh_mutex_create();
+    cache->allocator = buffer_cache_node_allocator_create(8192);
     return cache;
 }
 
-bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node) {
+static bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node)
+{
     if (!node) {
         return true;
     }
@@ -34,7 +93,11 @@ bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node) {
 bool clh_buffer_cache_destroy(CLH_BufferCache *cache)
 {
     clh_mutex_destroy(&cache->mutex);
+#ifdef CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
+    buffer_cache_node_allocator_destroy(cache->context, &cache->allocator);
+#else
     free_tree_(cache, cache->data);
+#endif
     free(cache);
     return true;
 }
@@ -67,7 +130,7 @@ CLH_BufferCacheEntry clh_buffer_cache_register_or_get(CLH_BufferCache *cache, CL
     CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
 
     if (*node == NULL) {
-        ucp_mem_h memh = NULL;
+        ucp_mem_h            memh = NULL;
         ucp_mem_map_params_t params = {
             .field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH
                           | UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE,
@@ -76,7 +139,11 @@ CLH_BufferCacheEntry clh_buffer_cache_register_or_get(CLH_BufferCache *cache, CL
             .memory_type = UCS_MEMORY_TYPE_UNKNOWN,
         };
         if (check_ucx(ucp_mem_map(cache->context, &params, &memh))) {
+#ifdef CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
+            *node = buffer_cache_node_allocator_create_node(&cache->allocator);
+#else
             *node = malloc(sizeof(CLH_BufferCacheNode));
+#endif
             (*node)->left = NULL;
             (*node)->right = NULL;
             (*node)->value.mem = buffer.mem;
@@ -98,7 +165,9 @@ void remove_node_(CLH_BufferCacheNode **node)
     CLH_BufferCacheNode *left = (*node)->left;
     CLH_BufferCacheNode *right = (*node)->right;
 
+#ifndef CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR // TODO: it stays in the arena :/
     free(*node);
+#endif
     *node = right;
     while (*node) {
         node = &(*node)->left;
