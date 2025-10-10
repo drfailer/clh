@@ -9,7 +9,8 @@
 
 #define CONF_WORKER_WAIT
 // #define CONF_LOOP_SLEEP
-// #define CONF_PROFILE
+#define CONF_PROFILE
+// #define CONF_USE_PROBE_QUEUE
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -466,9 +467,11 @@ static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
 {
     ucp_worker_params_t worker_params = {
         .field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
-        // .thread_mode = UCS_THREAD_MODE_SINGLE,
-        // .thread_mode = UCS_THREAD_MODE_SERIALIZED,
+#ifndef CONF_USE_PROBE_QUEUE
         .thread_mode = UCS_THREAD_MODE_MULTI,
+#else
+        .thread_mode = UCS_THREAD_MODE_SERIALIZED,
+#endif
     };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
         return CLH_STATUS_ERROR;
@@ -703,6 +706,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     return request;
 }
 
+#ifndef CONF_USE_PROBE_QUEUE
 CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove)
 {
     CLH_Request *request = clh_request_get(handle);
@@ -732,25 +736,42 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
 #endif
     return request;
 }
-
+#else
 /* if SERIALIZED mode is used */
-// CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove)
-// {
-//     CLH_Request *request = clh_request_get(handle);
-//     request->type = CLH_REQUEST_TYPE_PROBE;
-//     request->completed = false;
-//     request->data.probe.result = false;
-//     request->data.probe.remove = remove;
-//     request->data.probe.tag = tag;
-//     request->data.probe.tag_mask = tag_mask;
-//     request->data.probe.msg = NULL;
-//     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-//     array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
-//     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-//     WORKER_SIGNAL(handle);
-//     clh_wait(handle, request);
-//     return request;
-// }
+CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove)
+{
+    CLH_Request *request = clh_request_get(handle);
+    request->type = CLH_REQUEST_TYPE_PROBE;
+    request->completed = false;
+    request->data.probe.result = false;
+    request->data.probe.remove = remove;
+    request->data.probe.tag = tag;
+    request->data.probe.tag_mask = tag_mask;
+    request->data.probe.msg = NULL;
+#ifdef CONF_PROFILE
+    clh_perf_timer_start(probe);
+#endif
+    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
+    array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
+    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
+    WORKER_SIGNAL(handle);
+#ifdef CONF_PROFILE
+    clh_perf_timer_start(probe_wait);
+#endif
+    clh_wait(handle, request);
+#ifdef CONF_PROFILE
+    clh_perf_timer_end(probe_wait);
+    clh_perf_timer_end(probe);
+    clh_mutex_lock(&handle->mutex);
+    handle->stats.comm.probe_dur += clh_perf_timer_dur(probe);
+    handle->stats.comm.probe_count += 1;
+    handle->stats.comm.probe_wait_dur += clh_perf_timer_dur(probe_wait);
+    handle->stats.comm.probe_wait_count += 1;
+    clh_mutex_unlock(&handle->mutex);
+#endif
+    return request;
+}
+#endif
 
 /******************************************************************************/
 /*                              active messages                               */
