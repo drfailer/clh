@@ -7,6 +7,28 @@
 #include <string.h>
 #include <time.h>
 
+#define CONF_WORKER_WAIT
+// #define CONF_LOOP_SLEEP
+
+#ifdef CONF_WORKER_WAIT
+#define WORKER_WAIT(handle)                  \
+    do {                                     \
+        if (queues_emtpy_(handle)) {         \
+            ucp_worker_wait(handle->worker); \
+        }                                    \
+    } while (false);
+#define WORKER_SIGNAL(handle) ucp_worker_signal(handle->worker)
+#else
+#define WORKER_WAIT(handle)
+#define WORKER_SIGNAL(handle)
+#endif
+
+#ifdef CONF_LOOP_SLEEP
+#define SLEEP(time) usleep(time)
+#else
+#define SLEEP(time)
+#endif
+
 /******************************************************************************/
 /*                                   status                                   */
 /******************************************************************************/
@@ -90,6 +112,73 @@ static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_me
     return status;
 }
 
+static ucs_status_t internal_am_handler(void *arg, const void *header, size_t header_length,
+                                        void *data, size_t length,
+                                        const ucp_am_recv_param_t *recv_param)
+{
+    CLH_AMHandlerData *hd = (CLH_AMHandlerData *)arg;
+    CLH_Handle         handle = hd->handle;
+    CLH_Buffer         buf = {data, length};
+
+    if (recv_param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+        CLH_BufferCacheEntry bce = clh_buffer_cache_register_or_get(handle->buffer_cache, buf);
+        if (bce.mem == NULL) {
+            return UCS_ERR_NO_MEMORY;
+        }
+
+        ucp_request_param_t params = {
+            .op_attr_mask
+            = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
+            .datatype = ucp_dt_make_contig(1),
+            .memh = bce.memh,
+        };
+        ucs_status_ptr_t status
+            = ucp_am_recv_data_nbx(handle->worker, data, buf.mem, buf.len, &params);
+        clh_wait(handle, status); // TODO: how to do that efficiently?
+        // TODO: call calback function
+    } else {
+        CLH_Buffer   data_buf = {data, length};
+        CLH_AMHeader am_header = {header, header_length};
+        hd->user_callback(hd->user_callback_args, am_header, data_buf);
+    }
+    return UCS_OK;
+}
+
+static ucs_status_t ucx_set_am_handler(CLH_Handle handle, CLH_Request *request)
+{
+    CLH_AMHandlerData handler_data = {
+        .handle = handle,
+        .user_callback = request->data.set_am_handler.handler,
+        .user_callback_args = request->data.set_am_handler.handler_args,
+    };
+    size_t id = handle->am_handlers_data.len;
+    request->data.set_am_handler.id = id;
+    array_append(handle->am_handlers_data, handler_data);
+    ucp_am_handler_param_t params = {
+        .field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_FLAGS
+                      | UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_ARG,
+        .id = id,
+        .flags = UCP_AM_FLAG_WHOLE_MSG, // or UCP_AM_FLAG_PERSISTENT_DATA?
+        .cb = internal_am_handler,
+        .arg = &handle->am_handlers_data.ptr[id],
+    };
+    return ucp_worker_set_am_recv_handler(handle->worker, &params);
+}
+
+static ucs_status_ptr_t ucx_am_send(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
+{
+    ucp_request_param_t params = {
+        .op_attr_mask
+        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
+        .datatype = ucp_dt_make_contig(1),
+        .memh = memh,
+    };
+    return ucp_am_send_nbx(handle->endpoints[request->data.am_send.dest],
+                           request->data.am_send.handler_id, request->data.am_send.header.ptr,
+                           request->data.am_send.header.len, request->data.am_send.buffer.mem,
+                           request->data.am_send.buffer.len, &params);
+}
+
 static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 {
     if (UCS_PTR_IS_ERR(op->status_ptr)) {
@@ -103,75 +192,45 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
     return true;
 }
 
-static CLH_Status process_send_queue_(CLH_Handle handle)
-{
-    CLH_Status        status = CLH_STATUS_SUCCESS;
-    CLH_RequestArray *queue;
-
-    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len == 0) {
-        return status;
+#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                   \
+    static CLH_Status func_name(CLH_Handle handle)                                    \
+    {                                                                                 \
+        CLH_Status        status = CLH_STATUS_SUCCESS;                                \
+        CLH_RequestArray *queue;                                                      \
+                                                                                      \
+        if (handle->request_queues[queue_id].requests.len == 0) {                     \
+            return status;                                                            \
+        }                                                                             \
+                                                                                      \
+        clh_mutex_lock(&handle->request_queues[queue_id].mutex);                      \
+        queue = &handle->request_queues[queue_id].requests;                           \
+        for (size_t i = 0; i < queue->len; ++i) {                                     \
+            CLH_Op               op = {.request = queue->ptr[i], .status_ptr = NULL}; \
+            CLH_BufferCacheEntry bce = clh_buffer_cache_register_or_get(              \
+                handle->buffer_cache, op.request->data.send.buffer);                  \
+            if (bce.mem != op.request->data.send.buffer.mem) {                        \
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,             \
+                         op.request->data.send.buffer.mem);                           \
+                clh_error("UCX", "%s", "registration error (send).");                 \
+                status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;                        \
+                goto unlock_and_return;                                               \
+            }                                                                         \
+            op.status_ptr = ucx_func(handle, op.request, bce.memh);                   \
+            if (!validate_status_ptr_(handle, &op)) {                                 \
+                clh_error("UCX", "%s", #ucx_func " request failure (send).");         \
+                status = CLH_STATUS_REQUEST_FAILURE;                                  \
+                goto unlock_and_return;                                               \
+            }                                                                         \
+        }                                                                             \
+        queue->len = 0;                                                               \
+unlock_and_return:                                                                    \
+        clh_mutex_unlock(&handle->request_queues[queue_id].mutex);                    \
+        return status;                                                                \
     }
-
-    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
-    queue = &handle->request_queues[CLH_REQUEST_TYPE_SEND].requests;
-    for (size_t i = 0; i < queue->len; ++i) {
-        CLH_Op               op = {.request = queue->ptr[i], .status_ptr = NULL};
-        CLH_BufferCacheEntry bce
-            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->data.send.buffer);
-        if (bce.mem != op.request->data.send.buffer.mem) {
-            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
-                     op.request->data.send.buffer.mem);
-            clh_error("UCX", "%s", "registration error (send).");
-            status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-            goto unlock_and_return;
-        }
-        op.status_ptr = ucx_send(handle, op.request, bce.memh);
-        if (!validate_status_ptr_(handle, &op)) {
-            clh_error("UCX", "%s", "send request failure (send).");
-            status = CLH_STATUS_REQUEST_FAILURE;
-            goto unlock_and_return;
-        }
-    }
-    queue->len = 0;
-unlock_and_return:
-    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
-    return status;
-}
-
-static CLH_Status process_recv_queue_(CLH_Handle handle)
-{
-    CLH_Status        status = CLH_STATUS_SUCCESS;
-    CLH_RequestArray *queue;
-
-    if (handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len == 0) {
-        return status;
-    }
-
-    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
-    queue = &handle->request_queues[CLH_REQUEST_TYPE_RECV].requests;
-    for (size_t i = 0; i < queue->len; ++i) {
-        CLH_Op               op = {.request = queue->ptr[i], .status_ptr = NULL};
-        CLH_BufferCacheEntry bce
-            = clh_buffer_cache_register_or_get(handle->buffer_cache, op.request->data.recv.buffer);
-        if (bce.mem != op.request->data.recv.buffer.mem) {
-            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
-                     op.request->data.recv.buffer.mem);
-            clh_error("UCX", "%s", "registration error (recv).");
-            status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-            goto unlock_and_return;
-        }
-        op.status_ptr = ucx_recv(handle, op.request, bce.memh);
-        if (!validate_status_ptr_(handle, &op)) {
-            clh_error("UCX", "%s", "recv request failure (recv).");
-            status = CLH_STATUS_REQUEST_FAILURE;
-            goto unlock_and_return;
-        }
-    }
-    queue->len = 0;
-unlock_and_return:
-    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
-    return status;
-}
+PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
+PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
+PROCESS_SEND_RECV_QUEUE_FUNC(process_am_send_queue_, CLH_REQUEST_TYPE_AM_SEND, ucx_am_send)
+#undef PROCESS_SEND_RECV_QUEUE_FUNC
 
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
@@ -200,6 +259,29 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     }
     queue->len = 0;
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
+    return status;
+}
+
+static CLH_Status process_set_am_handler_queue_(CLH_Handle handle)
+{
+    CLH_Status        status = CLH_STATUS_SUCCESS;
+    CLH_RequestArray *queue;
+
+    if (handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests.len == 0) {
+        return status;
+    }
+
+    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
+    queue = &handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests;
+    for (size_t i = 0; i < queue->len; ++i) {
+        if (!check_ucx(ucx_set_am_handler(handle, queue->ptr[i]))) {
+            status = CLH_STATUS_ERROR;
+            goto unlock_and_return;
+        }
+    }
+    queue->len = 0;
+unlock_and_return:
+    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     return status;
 }
 
@@ -235,6 +317,8 @@ static CLH_Status process_shared_queues_(CLH_Handle handle)
     assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
     assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
     assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
+    assert(process_set_am_handler_queue_(handle) == CLH_STATUS_SUCCESS);
+    assert(process_am_send_queue_(handle) == CLH_STATUS_SUCCESS);
     return CLH_STATUS_SUCCESS;
 }
 
@@ -243,6 +327,8 @@ static bool queues_emtpy_(CLH_Handle handle)
     return handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len == 0
            && handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len == 0
            && handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0
+           && handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests.len == 0
+           && handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests.len == 0
            && handle->process_queue.len == 0;
 }
 
@@ -251,10 +337,12 @@ static void *run_(void *arg)
     CLH_Handle handle = (CLH_Handle)arg;
 
     while (handle->run || !queues_emtpy_(handle)) {
+        WORKER_WAIT(handle);
         process_shared_queues_(handle);
         while (ucp_worker_progress(handle->worker) > 0)
             ;
         process_request_queue_(handle);
+        SLEEP(1000);
     }
     printf("CLH RUN TERMINATE\n");
     return 0;
@@ -277,6 +365,7 @@ static void terminate_(CLH_Handle handle)
 {
     printf("CLH TERMINATE %d\n", clh_node_id(handle));
     handle->run = false;
+    WORKER_SIGNAL(handle);
     clh_thread_join(handle->run_thread);
     array_destroy(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
     array_destroy(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
@@ -483,6 +572,7 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
+    WORKER_SIGNAL(handle);
     return request;
 }
 
@@ -498,6 +588,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
+    WORKER_SIGNAL(handle);
     return request;
 }
 
@@ -516,6 +607,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
+    WORKER_SIGNAL(handle);
     return request;
 }
 
@@ -532,7 +624,46 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
     array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
+    WORKER_SIGNAL(handle);
     clh_wait(handle, request);
+    return request;
+}
+
+/******************************************************************************/
+/*                              active messages                               */
+/******************************************************************************/
+
+// TODO: test the am functions
+
+size_t clh_set_am_handler(CLH_Handle handle, CLH_AMHandler cb, void *args)
+{
+    CLH_Request *request = clh_request_get(handle);
+    request->type = CLH_REQUEST_TYPE_SET_AM_HANDLER;
+    request->completed = false;
+    request->data.set_am_handler.handler = cb;
+    request->data.set_am_handler.handler_args = args;
+    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
+    array_append(handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests, request);
+    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
+    WORKER_SIGNAL(handle);
+    clh_wait(handle, request);
+    return request->data.set_am_handler.id;
+}
+
+CLH_Request *clh_am_send(CLH_Handle handle, clh_u32 dest, clh_u32 id, CLH_AMHeader header,
+                         CLH_Buffer buffer)
+{
+    CLH_Request *request = clh_request_get(handle);
+    request->type = CLH_REQUEST_TYPE_AM_SEND;
+    request->completed = false;
+    request->data.am_send.buffer = buffer;
+    request->data.am_send.header = header;
+    request->data.am_send.dest = dest;
+    request->data.am_send.handler_id = id;
+    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex);
+    array_append(handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests, request);
+    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex);
+    WORKER_SIGNAL(handle);
     return request;
 }
 
@@ -634,73 +765,3 @@ clh_u32 clh_nb_nodes(CLH_Handle handle)
 {
     return clh_pmi_nb_nodes(handle->pmi);
 }
-
-/******************************************************************************/
-/*                              active messages                               */
-/******************************************************************************/
-
-// ucs_status_t internal_am_handler(void *arg, const void *header, size_t header_length, void *data,
-//                           size_t length, const ucp_am_recv_param_t *recv_param)
-// {
-//     CLH_AMHandlerData *hd = (CLH_AMHandlerData*)arg;
-//
-//     if (recv_param.recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
-//         CLH_BufferCacheEntry bce = clh_buffer_cache_register_or_get(handle->buffer_cache, buf);
-//         if (bce.mem == NULL) {
-//             return UCS_STATUS_ERROR;
-//         }
-//
-//         ucp_request_param_t params = {
-//             .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH |
-//             UCP_OP_ATTR_FLAG_NO_IMM_CMPL, .datatype = ucp_dt_make_contig(1), .memh = bce.memh,
-//         };
-//         ucs_status_ptr_t status = ucp_am_recv_data_nbx(handle->worker, data, buf.mem, buf.len,
-//         params); clh_wait(handle, status); // TODO: how to do that efficiently?
-//     } else {
-//         CLH_Buffer header_buf = {header, header_length};
-//         CLH_Buffer data_buf = {data, length};
-//         hd->user_callback(hd->user_callback_args, header_buf, data_buf);
-//     }
-//     return UCS_OK;
-// }
-//
-// CLH_Status clh_set_am_handler(CLH_Handle handle, clh_u32 id, CLH_AMHandler cb, void *args) {
-//     CLH_Status result = CLH_STATUS_SUCCESS;
-//
-//     handlers_datas[id].handle = handle;
-//     handlers_datas[id].user_callback = cb;
-//     handlers_datas[id].user_callback_args = args;
-//     ucp_am_handler_param_t params = {
-//         .field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_FLAGS |
-//         UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_ARG, .id = id, .flags =
-//         UCP_AM_FLAG_WHOLE_MSG, // or UCP_AM_FLAG_PERSISTENT_DATA? .cb = internal_am_handler, .arg
-//         = &handlers_datas[id],
-//     };
-//
-//     clh_mutex_lock(&handle->mutex);
-//     if (!check_ucx(ucp_worker_set_am_recv_handler(handle->worker, &params))) {
-//         result = CLH_STATUS_ERROR;
-//     }
-//     clh_mutex_unlock(&handle->mutex);
-//     return result;
-// }
-//
-// CLH_Status clh_am_send(CLH_Handle handle, clh_u32 node_id, clh_u32 id, CLH_Buffer header,
-//                        CLH_Buffer buf, CLH_Request *request)
-// {
-//     CLH_BufferCacheEntry bce = clh_buffer_cache_register_or_get(handle->buffer_cache, buf);
-//     if (bce.mem == NULL) {
-//         return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
-//     }
-//
-//     ucp_request_param_t params = {
-//         .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH |
-//         UCP_OP_ATTR_FLAG_NO_IMM_CMPL, .datatype = ucp_dt_make_contig(1), .memh = bce.memh,
-//     };
-//
-//     clh_mutex_lock(&handle->mutex);
-//     request->status = ucp_am_send_nbx(handle->endpoints[node_id], id, header.mem, header.len,
-//                                       buf.mem, buf.len, &params);
-//     clh_mutex_unlock(&handle->mutex);
-//     return CLH_STATUS_SUCCESS;
-// }
