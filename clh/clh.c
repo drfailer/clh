@@ -7,10 +7,15 @@
 #include <string.h>
 #include <time.h>
 
+// TODO:
+// - remove active message function
+// - move worker initialization in the run_
+// - test with SINGLE thread mode configuration for ucx
+
 #define CONF_WORKER_WAIT
 // #define CONF_LOOP_SLEEP
-#define CONF_PROFILE
-// #define CONF_USE_PROBE_QUEUE
+// #define CONF_PROFILE
+#define CONF_USE_PROBE_QUEUE
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -114,81 +119,6 @@ static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_me
     return status;
 }
 
-static ucs_status_t internal_am_handler(void *arg, const void *header, size_t header_length,
-                                        void *data, size_t length,
-                                        const ucp_am_recv_param_t *recv_param)
-{
-    CLH_AMHandlerData *hd = (CLH_AMHandlerData *)arg;
-    CLH_Handle         handle = hd->handle;
-    CLH_Buffer         buf = {data, length};
-
-    if (recv_param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
-#ifdef CONF_PROFILE
-        clh_perf_timer_start(register);
-#endif
-        CLH_BufferCacheEntry bce = clh_buffer_cache_register_or_get(handle->buffer_cache, buf);
-        if (bce.mem == NULL) {
-            return UCS_ERR_NO_MEMORY;
-        }
-#ifdef CONF_PROFILE
-        clh_perf_timer_end(register);
-        handle->stats.cache.register_dur += clh_perf_timer_dur(register);
-        handle->stats.cache.register_count += 1;
-#endif
-
-        ucp_request_param_t params = {
-            .op_attr_mask
-            = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
-            .datatype = ucp_dt_make_contig(1),
-            .memh = bce.memh,
-        };
-        ucs_status_ptr_t status
-            = ucp_am_recv_data_nbx(handle->worker, data, buf.mem, buf.len, &params);
-        clh_wait(handle, status); // TODO: how to do that efficiently?
-        // TODO: call calback function
-    } else {
-        CLH_Buffer   data_buf = {data, length};
-        CLH_AMHeader am_header = {header, header_length};
-        hd->user_callback(hd->user_callback_args, am_header, data_buf);
-    }
-    return UCS_OK;
-}
-
-static ucs_status_t ucx_set_am_handler(CLH_Handle handle, CLH_Request *request)
-{
-    CLH_AMHandlerData handler_data = {
-        .handle = handle,
-        .user_callback = request->data.set_am_handler.handler,
-        .user_callback_args = request->data.set_am_handler.handler_args,
-    };
-    size_t id = handle->am_handlers_data.len;
-    request->data.set_am_handler.id = id;
-    array_append(handle->am_handlers_data, handler_data);
-    ucp_am_handler_param_t params = {
-        .field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_FLAGS
-                      | UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_ARG,
-        .id = id,
-        .flags = UCP_AM_FLAG_WHOLE_MSG, // or UCP_AM_FLAG_PERSISTENT_DATA?
-        .cb = internal_am_handler,
-        .arg = &handle->am_handlers_data.ptr[id],
-    };
-    return ucp_worker_set_am_recv_handler(handle->worker, &params);
-}
-
-static ucs_status_ptr_t ucx_am_send(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
-{
-    ucp_request_param_t params = {
-        .op_attr_mask
-        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
-        .datatype = ucp_dt_make_contig(1),
-        .memh = memh,
-    };
-    return ucp_am_send_nbx(handle->endpoints[request->data.am_send.dest],
-                           request->data.am_send.handler_id, request->data.am_send.header.ptr,
-                           request->data.am_send.header.len, request->data.am_send.buffer.mem,
-                           request->data.am_send.buffer.len, &params);
-}
-
 static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 {
     if (UCS_PTR_IS_ERR(op->status_ptr)) {
@@ -243,7 +173,6 @@ unlock_and_return:                                                            \
     }
 PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
 PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
-PROCESS_SEND_RECV_QUEUE_FUNC(process_am_send_queue_, CLH_REQUEST_TYPE_AM_SEND, ucx_am_send)
 #undef PROCESS_SEND_RECV_QUEUE_FUNC
 
 static CLH_Status process_probe_queue_(CLH_Handle handle)
@@ -273,29 +202,6 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     }
     queue->len = 0;
     clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-    return status;
-}
-
-static CLH_Status process_set_am_handler_queue_(CLH_Handle handle)
-{
-    CLH_Status        status = CLH_STATUS_SUCCESS;
-    CLH_RequestArray *queue;
-
-    if (handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests.len == 0) {
-        return status;
-    }
-
-    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
-    queue = &handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests;
-    for (size_t i = 0; i < queue->len; ++i) {
-        if (!check_ucx(ucx_set_am_handler(handle, queue->ptr[i]))) {
-            status = CLH_STATUS_ERROR;
-            goto unlock_and_return;
-        }
-    }
-    queue->len = 0;
-unlock_and_return:
-    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     return status;
 }
 
@@ -331,8 +237,6 @@ static CLH_Status process_shared_queues_(CLH_Handle handle)
     assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
     assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
     assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
-    assert(process_set_am_handler_queue_(handle) == CLH_STATUS_SUCCESS);
-    assert(process_am_send_queue_(handle) == CLH_STATUS_SUCCESS);
     return CLH_STATUS_SUCCESS;
 }
 
@@ -341,8 +245,6 @@ static bool queues_emtpy_(CLH_Handle handle)
     return handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len == 0
            && handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len == 0
            && handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0
-           && handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests.len == 0
-           && handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests.len == 0
            && handle->process_queue.len == 0;
 }
 
@@ -376,7 +278,7 @@ static void *run_(void *arg)
 #ifdef CONF_PROFILE
         clh_perf_timer_start(process_requests);
 #endif
-        process_request_queue_(handle);
+        assert(process_request_queue_(handle) == CLH_STATUS_SUCCESS);
 #ifdef CONF_PROFILE
         clh_perf_timer_end(process_requests);
         handle->stats.run.process_requests_dur += clh_perf_timer_dur(process_requests);
@@ -394,14 +296,10 @@ static void start_(CLH_Handle handle)
     array_create(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, 128);
     array_create(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, 128);
     array_create(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, 128);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests, 128);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests, 128);
     array_create(handle->process_queue, 128);
     handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex = clh_mutex_create();
     handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex = clh_mutex_create();
     handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex = clh_mutex_create();
-    handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex = clh_mutex_create();
-    handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex = clh_mutex_create();
     handle->run_thread = clh_thread_spawn(&run_, handle);
 }
 
@@ -414,14 +312,10 @@ static void terminate_(CLH_Handle handle)
     array_destroy(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
     array_destroy(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
     array_destroy(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
-    array_destroy(handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests);
-    array_destroy(handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests);
     array_destroy(handle->process_queue);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-    clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex);
-    clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
 
     // clang-format off
 #ifdef CONF_PROFILE
@@ -472,6 +366,7 @@ static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
 #else
         .thread_mode = UCS_THREAD_MODE_SERIALIZED,
 #endif
+        // .thread_mode = UCS_THREAD_MODE_SINGLE,
     };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
         return CLH_STATUS_ERROR;
@@ -772,44 +667,6 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     return request;
 }
 #endif
-
-/******************************************************************************/
-/*                              active messages                               */
-/******************************************************************************/
-
-// TODO: test the am functions
-
-size_t clh_set_am_handler(CLH_Handle handle, CLH_AMHandler cb, void *args)
-{
-    CLH_Request *request = clh_request_get(handle);
-    request->type = CLH_REQUEST_TYPE_SET_AM_HANDLER;
-    request->completed = false;
-    request->data.set_am_handler.handler = cb;
-    request->data.set_am_handler.handler_args = args;
-    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
-    array_append(handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].requests, request);
-    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_SET_AM_HANDLER].mutex);
-    WORKER_SIGNAL(handle);
-    clh_wait(handle, request);
-    return request->data.set_am_handler.id;
-}
-
-CLH_Request *clh_am_send(CLH_Handle handle, clh_u32 dest, clh_u32 id, CLH_AMHeader header,
-                         CLH_Buffer buffer)
-{
-    CLH_Request *request = clh_request_get(handle);
-    request->type = CLH_REQUEST_TYPE_AM_SEND;
-    request->completed = false;
-    request->data.am_send.buffer = buffer;
-    request->data.am_send.header = header;
-    request->data.am_send.dest = dest;
-    request->data.am_send.handler_id = id;
-    clh_mutex_lock(&handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex);
-    array_append(handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].requests, request);
-    clh_mutex_unlock(&handle->request_queues[CLH_REQUEST_TYPE_AM_SEND].mutex);
-    WORKER_SIGNAL(handle);
-    return request;
-}
 
 /******************************************************************************/
 /*                                  requests                                  */

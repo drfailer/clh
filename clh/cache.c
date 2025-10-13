@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// #define CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
+#define CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
 
 /******************************************************************************/
 /*                           buffer cache allocator                           */

@@ -4,10 +4,10 @@
 #include "buffer.h"
 #include "cache.h"
 #include "clh_defs.h"
+#include "clh_perf.h"
 #include "pmi.h"
 #include "thread.h"
 #include <ucp/api/ucp.h>
-#include "clh_perf.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,31 +15,16 @@ extern "C" {
 
 typedef struct CLH_HandleData *CLH_Handle;
 
-typedef struct {
-    const void *ptr;
-    size_t len;
-} CLH_AMHeader;
-typedef bool (*CLH_AMHandler)(void *arg, CLH_AMHeader, CLH_Buffer buf);
-
-typedef struct {
-    CLH_Handle    handle;
-    CLH_AMHandler user_callback;
-    void         *user_callback_args;
-} CLH_AMHandlerData;
-
-Array(CLH_AMHandlerData) CLH_AMHandlerDataArray;
+typedef struct CLH_Request CLH_Request;
 
 typedef enum {
     CLH_REQUEST_TYPE_SEND,
     CLH_REQUEST_TYPE_RECV,
     CLH_REQUEST_TYPE_PROBE,
-    CLH_REQUEST_TYPE_AM_SEND,
-    CLH_REQUEST_TYPE_SET_AM_HANDLER,
 } CLH_RequestType;
-#define CLH_NUMBER_REQUEST_TYPES 5
+#define CLH_NUMBER_REQUEST_TYPES 6
 
-// TODO: one mutex + conditional variable per request + use union for clarity
-typedef struct {
+struct CLH_Request {
     CLH_RequestType         type;
     bool                    completed;
     CLH_Mutex               mutex;
@@ -65,19 +50,8 @@ typedef struct {
             clh_u64           tag_mask;
             ucp_tag_message_h msg;
         } recv;
-        struct {
-            CLH_Buffer buffer;
-            CLH_AMHeader header;
-            clh_u32    dest;
-            size_t handler_id;
-        } am_send;
-        struct {
-            CLH_AMHandler handler;
-            void *handler_args;
-            size_t id;
-        } set_am_handler;
     } data;
-} CLH_Request;
+};
 
 Array(CLH_Request *) CLH_RequestArray;
 typedef struct {
@@ -109,41 +83,40 @@ typedef struct {
 Array(CLH_Op) CLH_Ops;
 
 struct CLH_HandleData {
-    CLH_PMI_Handle   pmi;
-    ucp_context_h    ucp_context;
-    ucp_worker_h     worker;
-    CLH_Address      address;
-    ucp_ep_h        *endpoints;
-    CLH_BufferCache *buffer_cache;
-    bool             run;
-    CLH_Thread       run_thread;
-    CLH_Mutex        mutex;
-    CLH_RequestQueue request_queues[CLH_NUMBER_REQUEST_TYPES];
-    CLH_Ops          process_queue;
-    CLH_RequestPool  request_pool;
-    CLH_AMHandlerDataArray am_handlers_data;
+    CLH_PMI_Handle         pmi;
+    ucp_context_h          ucp_context;
+    ucp_worker_h           worker;
+    CLH_Address            address;
+    ucp_ep_h              *endpoints;
+    CLH_BufferCache       *buffer_cache;
+    bool                   run;
+    CLH_Thread             run_thread;
+    CLH_Mutex              mutex;
+    CLH_RequestQueue       request_queues[CLH_NUMBER_REQUEST_TYPES];
+    CLH_Ops                process_queue;
+    CLH_RequestPool        request_pool;
     struct {
         struct {
             CLH_Duration register_dur;
-            size_t register_count;
+            size_t       register_count;
         } cache;
         struct {
             CLH_Duration progress_dur;
-            size_t progress_count;
+            size_t       progress_count;
             CLH_Duration process_shared_queues_dur;
-            size_t process_shared_queues_count;
+            size_t       process_shared_queues_count;
             CLH_Duration process_requests_dur;
-            size_t process_requests_count;
+            size_t       process_requests_count;
         } run;
         struct {
             CLH_Duration send_dur;
-            size_t send_count;
+            size_t       send_count;
             CLH_Duration recv_dur;
-            size_t recv_count;
+            size_t       recv_count;
             CLH_Duration probe_dur;
-            size_t probe_count;
+            size_t       probe_count;
             CLH_Duration probe_wait_dur;
-            size_t probe_wait_count;
+            size_t       probe_wait_count;
         } comm;
     } stats;
 };
