@@ -126,36 +126,37 @@ CLH_BufferCacheEntry clh_buffer_cache_register_or_get(CLH_BufferCache *cache, CL
         return result;
     }
 
-    clh_mutex_lock(&cache->mutex);
-    CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
+    CLH_LOCK_REGION(cache->mutex)
+    {
+        CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
 
-    if (*node == NULL) {
-        ucp_mem_h            memh = NULL;
-        ucp_mem_map_params_t params = {
-            .field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH
-                          | UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE,
-            .address = buffer.mem,
-            .length = buffer.len,
-            .memory_type = UCS_MEMORY_TYPE_UNKNOWN,
-        };
-        if (check_ucx(ucp_mem_map(cache->context, &params, &memh))) {
+        if (*node == NULL) {
+            ucp_mem_h            memh = NULL;
+            ucp_mem_map_params_t params = {
+                .field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH
+                              | UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE,
+                .address = buffer.mem,
+                .length = buffer.len,
+                .memory_type = UCS_MEMORY_TYPE_UNKNOWN,
+            };
+            if (check_ucx(ucp_mem_map(cache->context, &params, &memh))) {
 #ifdef CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
-            *node = buffer_cache_node_allocator_create_node(&cache->allocator);
+                *node = buffer_cache_node_allocator_create_node(&cache->allocator);
 #else
-            *node = malloc(sizeof(CLH_BufferCacheNode));
+                *node = malloc(sizeof(CLH_BufferCacheNode));
 #endif
-            (*node)->left = NULL;
-            (*node)->right = NULL;
-            (*node)->value.mem = buffer.mem;
-            (*node)->value.memh = memh;
+                (*node)->left = NULL;
+                (*node)->right = NULL;
+                (*node)->value.mem = buffer.mem;
+                (*node)->value.memh = memh;
+                result = (*node)->value;
+                assert(result.mem == buffer.mem);
+            }
+        } else {
             result = (*node)->value;
             assert(result.mem == buffer.mem);
         }
-    } else {
-        result = (*node)->value;
-        assert(result.mem == buffer.mem);
     }
-    clh_mutex_unlock(&cache->mutex);
     assert(result.mem == buffer.mem);
     return result;
 }
@@ -179,28 +180,30 @@ bool clh_buffer_cache_unregister(CLH_BufferCache *cache, CLH_Buffer buffer)
 {
     bool result = true;
 
-    clh_mutex_lock(&cache->mutex);
-    CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
+    CLH_LOCK_REGION(cache->mutex)
+    {
+        CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
 
-    if (*node == NULL) {
-        result = false;
-        goto exit;
-    }
+        if (*node == NULL) {
+            result = false;
+            CLH_EXIT_LOCK_REGION();
+        }
 
-    if (!check_ucx(ucp_mem_unmap(cache->context, (*node)->value.memh))) {
-        result = false;
-        goto exit;
+        if (!check_ucx(ucp_mem_unmap(cache->context, (*node)->value.memh))) {
+            result = false;
+            CLH_EXIT_LOCK_REGION();
+        }
+        remove_node_(node);
     }
-    remove_node_(node);
-    clh_mutex_unlock(&cache->mutex);
-exit:
     return result;
 }
 
 bool clh_buffer_cache_is_registered(CLH_BufferCache *cache, CLH_Buffer buffer)
 {
-    clh_mutex_lock(&cache->mutex);
-    CLH_BufferCacheNode **node = buffer_cache_search_(cache, buffer);
+    CLH_BufferCacheNode **node = NULL;
+    CLH_LOCK_REGION(cache->mutex) {
+        node = buffer_cache_search_(cache, buffer);
+    }
     clh_mutex_unlock(&cache->mutex);
     return *node != NULL;
 }
