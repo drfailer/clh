@@ -26,17 +26,8 @@ void clh_conditional_variable_wait(CLH_ConditionalVariable *cv, CLH_Mutex *mutex
 void clh_conditional_variable_notify_one(CLH_ConditionalVariable *cv);
 void clh_conditional_variable_notify_all(CLH_ConditionalVariable *cv);
 
-inline bool clh_lock_region_init(CLH_Mutex *mutex)
-{
-    clh_mutex_lock(mutex);
-    return false;
-}
-
-inline bool clh_lock_region_end(CLH_Mutex *mutex)
-{
-    clh_mutex_unlock(mutex);
-    return true;
-}
+bool clh_lock_region_init(CLH_Mutex *mutex);
+bool clh_lock_region_end(CLH_Mutex *mutex);
 
 #define CLH_LOCK_REGION(mutex_) \
     for (bool done = clh_lock_region_init(&mutex_); !done; done = clh_lock_region_end(&mutex_))

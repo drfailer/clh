@@ -61,3 +61,15 @@ void clh_conditional_variable_notify_all(CLH_ConditionalVariable *cv)
 {
     pthread_cond_broadcast(cv);
 }
+
+bool clh_lock_region_init(CLH_Mutex *mutex)
+{
+    clh_mutex_lock(mutex);
+    return false;
+}
+
+bool clh_lock_region_end(CLH_Mutex *mutex)
+{
+    clh_mutex_unlock(mutex);
+    return true;
+}
