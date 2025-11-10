@@ -8,6 +8,8 @@
 #include "pmi.h"
 #include "thread.h"
 #include <ucp/api/ucp.h>
+#define ENABLE_TRACER
+#include <tracer.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -95,6 +97,8 @@ struct CLH_HandleData {
     CLH_RequestQueue       request_queues[CLH_NUMBER_REQUEST_TYPES];
     CLH_Ops                process_queue;
     CLH_RequestPool        request_pool;
+    TracerHandle          *tracer;
+    CLH_ConditionalVariable init_cv;
     struct {
         struct {
             CLH_Duration register_dur;

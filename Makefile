@@ -1,8 +1,11 @@
 CC=gcc
 CFLAGS=-Wall -Wextra -Wuninitialized -Wno-sign-compare -fdiagnostics-color=auto \
 	   -I$(HOME)/Programming/usr/include -I/usr/lib/x86_64-linux-gnu/pmix2/include \
+	   -I$(HOME)/Programming/projects/tracer-c/tracer \
 	   -fPIC -g -O3
-LDFLAGS=-L$(HOME)/Programming/usr/lib -lucp -lucs -L/usr/lib/x86_64-linux-gnu/pmix2/lib -lpmix -lpthread
+LDFLAGS=-L$(HOME)/Programming/usr/lib -lucp -lucs \
+		-L/usr/lib/x86_64-linux-gnu/pmix2/lib -lpmix -lpthread \
+		-L$(HOME)/Programming/projects/tracer-c/build/lib -l:libtracer.a
 SRC=$(wildcard clh/*.c)
 OBJ=$(addprefix build/,$(SRC:clh/%.c=%.o))
 DEP=$(addprefix build/,$(SRC:clh/%.c=%.d))
