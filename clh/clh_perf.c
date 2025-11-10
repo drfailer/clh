@@ -3,7 +3,7 @@
 CLH_TimePoint clh_perf_tp_get()
 {
     CLH_TimePoint tp;
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &tp);
+    clock_gettime(CLOCK_MONOTONIC, &tp);
     return tp;
 }
 
