@@ -337,8 +337,8 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
             queue = &handle->request_queues[queue_id].requests;                           \
             for (size_t i = 0; i < queue->len; ++i) {                                     \
                 CLH_Op op = {.request = queue->ptr[i], .status_ptr = NULL};               \
-                /* CLH_PERF_REGION(handle, cache, register) */                                  \
-                TRACER_LOCAL_REGION(handle->tracer, "cache.register", "clh") \
+                /* CLH_PERF_REGION(handle, cache, register) */                            \
+                TRACER_LOCAL_REGION(handle->tracer, "register", "clh.worker.cache")       \
                 {                                                                         \
                     bce = clh_buffer_cache_register_or_get(handle->buffer_cache,          \
                                                            op.request->data.send.buffer); \
@@ -465,18 +465,18 @@ static void *run_(void *arg)
     while (handle->run || !queues_emtpy_(handle)) {
         WORKER_WAIT(handle);
         // CLH_PERF_REGION(handle, run, process_shared_queues)
-        TRACER_LOCAL_REGION(handle->tracer, "process shared queues", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "process shared queues", "worker")
         {
             process_shared_queues_(handle);
         }
         // CLH_PERF_REGION(handle, run, progress)
-        TRACER_LOCAL_REGION(handle->tracer, "progress worker", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "progress worker", "worker")
         {
             while (ucp_worker_progress(handle->worker) > 0)
                 ;
         }
         // CLH_PERF_REGION(handle, run, process_requests)
-        TRACER_LOCAL_REGION(handle->tracer, "process request queue", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "process request queue", "worker")
         {
             assert(process_request_queue_(handle) == CLH_STATUS_SUCCESS);
         }
@@ -543,30 +543,36 @@ static void terminate_(CLH_Handle handle)
 CLH_Status clh_init(CLH_Handle *handle)
 {
     *handle = calloc(1, sizeof(struct CLH_HandleData));
-    if (clh_pmi_init(&(*handle)->pmi) != CLH_PMI_STATUS_SUCCESS) {
-        return CLH_STATUS_PMI_ERROR;
-    }
-    (*handle)->mutex = clh_mutex_create();
-    (*handle)->request_pool.mutex = clh_mutex_create();
-    (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
     (*handle)->tracer = TRACER_CREATE(0);
-    start_(*handle);
+    TRACER_LOCAL_REGION((*handle)->tracer, "init", "clh")
+    {
+        if (clh_pmi_init(&(*handle)->pmi) != CLH_PMI_STATUS_SUCCESS) {
+            return CLH_STATUS_PMI_ERROR;
+        }
+        (*handle)->mutex = clh_mutex_create();
+        (*handle)->request_pool.mutex = clh_mutex_create();
+        (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
+        start_(*handle);
+    }
     return CLH_STATUS_SUCCESS;
 }
 
 CLH_Status clh_finalize(CLH_Handle handle)
 {
-    clh_pmi_sync(handle->pmi);
-    terminate_(handle);
-    clh_pmi_finalize(handle->pmi);
-    clh_mutex_destroy(&handle->mutex);
-    clh_mutex_destroy(&handle->request_pool.mutex);
-    for (struct CLH_RequestPoolNode *node = handle->request_pool.free_nodes; node != NULL;) {
-        struct CLH_RequestPoolNode *next = node->next;
-        clh_request_pool_node_destroy(node);
-        node = next;
+    TRACER_LOCAL_REGION(handle->tracer, "finalize", "clh")
+    {
+        clh_pmi_sync(handle->pmi);
+        terminate_(handle);
+        clh_pmi_finalize(handle->pmi);
+        clh_mutex_destroy(&handle->mutex);
+        clh_mutex_destroy(&handle->request_pool.mutex);
+        for (struct CLH_RequestPoolNode *node = handle->request_pool.free_nodes; node != NULL;) {
+            struct CLH_RequestPoolNode *next = node->next;
+            clh_request_pool_node_destroy(node);
+            node = next;
+        }
+        TRACER_WRITE(handle->tracer, "clh_trace.tr");
     }
-    TRACER_WRITE(handle->tracer, "clh_trace.tr");
     TRACER_DESTROY(handle->tracer);
     free(handle);
     return CLH_STATUS_SUCCESS;
@@ -617,7 +623,7 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
     {
         CLH_Op op = {.request = request, .status_ptr = NULL};
         // CLH_PERF_REGION(handle, cache, register)
-        TRACER_LOCAL_REGION(handle->tracer, "cache.register", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
             bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
                                                    op.request->data.send.buffer);
@@ -704,7 +710,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
     {
         CLH_Op op = {.request = request, .status_ptr = NULL};
         // CLH_PERF_REGION(handle, cache, register)
-        TRACER_LOCAL_REGION(handle->tracer, "cache.register", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
             bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
                                                    op.request->data.recv.buffer);
@@ -745,7 +751,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     {
         CLH_Op op = {.request = request, .status_ptr = NULL};
         // CLH_PERF_REGION(handle, cache, register)
-        TRACER_LOCAL_REGION(handle->tracer, "cache.register", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
             bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
                                                    op.request->data.recv.buffer);
@@ -790,7 +796,7 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
         }
         WORKER_SIGNAL(handle);
         // CLH_PERF_REGION(handle, comm, probe_wait)
-        TRACER_LOCAL_REGION(handle->tracer, "probe.wait", "clh")
+        TRACER_LOCAL_REGION(handle->tracer, "wait", "clh.probe")
         {
             clh_wait(handle, request);
         }
