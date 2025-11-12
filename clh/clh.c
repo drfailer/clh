@@ -9,7 +9,7 @@
 
 #define CONF_WORKER_WAIT
 #define CONF_LOOP_SLEEP_TIME 1000
-// #define CONF_PROGRESS_OP_COUNT
+#define CONF_PROGRESS_COUNT 100
 // #define CONF_PROFILE
 #define CONF_USE_SEND_REQUEST_QUEUE
 #define CONF_USE_RECV_REQUEST_QUEUE
@@ -56,11 +56,13 @@ inline CLH_PerfRegionData clh_perf_region_data_start()
 #define SLEEP()
 #endif
 
-#ifdef CONF_PROGRESS_OP_COUNT
+#ifdef CONF_PROGRESS_COUNT
 // TODO: we need an op counter in the handle
-#define WORKER_PROGRESS(handle)                          \
-    for (size_t i = 0; i < handle->ops_queue.len; ++i) { \
-        ucp_worker_progress(handle->worker);             \
+#define WORKER_PROGRESS(handle)                         \
+    for (size_t i = 0; i < CONF_PROGRESS_COUNT; ++i) {  \
+        if (ucp_worker_progress(handle->worker) == 0) { \
+            break;                                      \
+        }                                               \
     }
 #else
 #define WORKER_PROGRESS(handle)                     \
