@@ -7,6 +7,7 @@ int main(int, char **)
 {
     CLH_Handle clh = NULL;
     char message[1024] = {0};
+    char trace_file[32] = {0};
 
     if (clh_init(&clh) != CLH_STATUS_SUCCESS) {
         return 1;
