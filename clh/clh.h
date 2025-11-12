@@ -95,7 +95,7 @@ struct CLH_HandleData {
     CLH_Thread             run_thread;
     CLH_Mutex              mutex;
     CLH_RequestQueue       request_queues[CLH_NUMBER_REQUEST_TYPES];
-    CLH_Ops                process_queue;
+    CLH_Ops                ops_queue;
     CLH_RequestPool        request_pool;
     TracerHandle          *tracer;
     CLH_ConditionalVariable init_cv;
@@ -109,8 +109,8 @@ struct CLH_HandleData {
             size_t       progress_count;
             CLH_Duration process_shared_queues_dur;
             size_t       process_shared_queues_count;
-            CLH_Duration process_requests_dur;
-            size_t       process_requests_count;
+            CLH_Duration process_ops_dur;
+            size_t       process_ops_count;
         } run;
         struct {
             CLH_Duration send_dur;
