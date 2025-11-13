@@ -1,4 +1,5 @@
 #include "thread.h"
+#include <errno.h>
 
 CLH_Thread clh_thread_spawn(CLH_ThreadCallback cb, void *args)
 {
@@ -72,4 +73,12 @@ bool clh_lock_region_end(CLH_Mutex *mutex)
 {
     clh_mutex_unlock(mutex);
     return true;
+}
+
+bool clh_trylock_region_init(CLH_Mutex *mutex)
+{
+    if (EBUSY == pthread_mutex_trylock(mutex)) {
+        return true;
+    }
+    return false;
 }

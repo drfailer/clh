@@ -1,6 +1,7 @@
 #ifndef CLH_THREAD
 #define CLH_THREAD
 #include <pthread.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,9 +29,13 @@ void clh_conditional_variable_notify_all(CLH_ConditionalVariable *cv);
 
 bool clh_lock_region_init(CLH_Mutex *mutex);
 bool clh_lock_region_end(CLH_Mutex *mutex);
+bool clh_trylock_region_init(CLH_Mutex *mutex);
+bool clh_trylock_region_end(CLH_Mutex *mutex);
 
 #define CLH_LOCK_REGION(mutex_) \
     for (bool done = clh_lock_region_init(&mutex_); !done; done = clh_lock_region_end(&mutex_))
+#define CLH_TRYLOCK_REGION(mutex_) \
+    for (bool done = clh_trylock_region_init(&mutex_); !done; done = clh_lock_region_end(&mutex_))
 #define CLH_EXIT_LOCK_REGION() continue
 
 #ifdef __cplusplus
