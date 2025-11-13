@@ -9,7 +9,7 @@
 
 #define CONF_WORKER_WAIT
 #define CONF_LOOP_SLEEP_TIME 1000
-#define CONF_PROGRESS_COUNT 100
+// #define CONF_PROGRESS_COUNT 100
 // #define CONF_PROFILE
 #define CONF_USE_SEND_REQUEST_QUEUE
 #define CONF_USE_RECV_REQUEST_QUEUE
@@ -58,16 +58,23 @@ inline CLH_PerfRegionData clh_perf_region_data_start()
 
 #ifdef CONF_PROGRESS_COUNT
 // TODO: we need an op counter in the handle
-#define WORKER_PROGRESS(handle)                         \
-    for (size_t i = 0; i < CONF_PROGRESS_COUNT; ++i) {  \
-        if (ucp_worker_progress(handle->worker) == 0) { \
-            break;                                      \
-        }                                               \
+#define WORKER_PROGRESS(handle, count)                         \
+    for (size_t i = 0; i < CONF_PROGRESS_COUNT; ++i) {         \
+        size_t progress = ucp_worker_progress(handle->worker); \
+        if (progress == 0) {                                   \
+            break;                                             \
+        }                                                      \
+        count += progress;                                     \
     }
 #else
-#define WORKER_PROGRESS(handle)                     \
-    while (ucp_worker_progress(handle->worker) > 0) \
-        ;
+#define WORKER_PROGRESS(handle, count)                         \
+    while (true) {                                             \
+        size_t progress = ucp_worker_progress(handle->worker); \
+        if (progress == 0) {                                   \
+            break;                                             \
+        }                                                      \
+        count += progress;                                     \
+    }
 #endif
 
 /******************************************************************************/
@@ -349,7 +356,7 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
             return status;                                                                    \
         }                                                                                     \
                                                                                               \
-        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                               \
+        CLH_TRYLOCK_REGION(handle->request_queues[queue_id].mutex)                               \
         {                                                                                     \
             queue = &handle->request_queues[queue_id].requests;                               \
             for (size_t i = 0; i < queue->len; ++i) {                                         \
@@ -446,13 +453,22 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
 static inline CLH_Status process_shared_queues_(CLH_Handle handle)
 {
 #if defined(CONF_USE_PROBE_REQUEST_QUEUE)
-    assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
+    TRACER_LOCAL_REGION(handle->tracer, "process probe queue,#00C99AFF", "clh.queues")
+    {
+        assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
+    }
 #endif
 #if defined(CONF_USE_SEND_REQUEST_QUEUE)
-    assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
+    TRACER_LOCAL_REGION(handle->tracer, "process send queue,#00990CFF", "clh.queues")
+    {
+        assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
+    }
 #endif
 #if defined(CONF_USE_RECV_REQUEST_QUEUE)
-    assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
+    TRACER_LOCAL_REGION(handle->tracer, "process recv queue,#F5E900FF", "clh.queues")
+    {
+        assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
+    }
 #endif
     return CLH_STATUS_SUCCESS;
 }
@@ -485,16 +501,22 @@ static void *run_(void *arg)
         WORKER_WAIT(handle);
         CLH_PERF_REGION(handle, run, process_shared_queues)
         {
-            TRACER_LOCAL_REGION(handle->tracer, "process shared queues,#F7C48BFF", "clh.worker", "node = %d", clh_node_id(handle))
+            size_t nb_send = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len;
+            size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len;
+            size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len;
+            TRACER_LOCAL_REGION(handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
+                    "node = %d,send queue size = %ld,recv queue size = %ld,probe queue size = %ld",
+                    clh_node_id(handle), nb_send, nb_recv, nb_probe)
             {
                 process_shared_queues_(handle);
             }
         }
         CLH_PERF_REGION(handle, run, progress)
         {
-            TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker", "node = %d", clh_node_id(handle))
+            size_t progress_count = 0;
+            TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker", "node = %d,progress count = %ld", clh_node_id(handle), progress_count)
             {
-                WORKER_PROGRESS(handle);
+                WORKER_PROGRESS(handle, progress_count);
             }
         }
         CLH_PERF_REGION(handle, run, process_ops)
@@ -513,10 +535,10 @@ static void *run_(void *arg)
 
 static void start_(CLH_Handle handle)
 {
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, 128);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, 128);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, 128);
-    array_create(handle->ops_queue, 128);
+    array_create(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, 1024);
+    array_create(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, 1024);
+    array_create(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, 1024);
+    array_create(handle->ops_queue, 1024);
     handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex = clh_mutex_create();
     handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex = clh_mutex_create();
     handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex = clh_mutex_create();
