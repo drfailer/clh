@@ -29,7 +29,7 @@ CLH_PMI_Status clh_pmi_init(CLH_PMI_Handle *pmi)
     if (!check_pmi(PMIx_Init(&pmi_->proc, NULL, 0))) {
         return CLH_PMI_STATUS_ERROR;
     }
-    PMIx_Load_procid(&pmi_->proc_wild, pmi_->proc.nspace, PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&pmi_->proc_wild, pmi_->proc.nspace, PMIX_RANK_WILDCARD);
     pmi_->node_id = pmi_->proc.rank;
 
     pmix_value_t *value = NULL;
@@ -37,7 +37,7 @@ CLH_PMI_Status clh_pmi_init(CLH_PMI_Handle *pmi)
         return CLH_PMI_STATUS_ERROR;
     }
     pmi_->nb_nodes = value->data.uint32;
-    PMIx_Value_destruct(value);
+    PMIX_VALUE_DESTRUCT(value);
     return CLH_PMI_STATUS_SUCCESS;
 }
 
@@ -45,8 +45,8 @@ CLH_PMI_Status clh_pmi_finalize(CLH_PMI_Handle pmi)
 {
     struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
 
-    PMIx_Proc_destruct(&pmi_->proc);
-    PMIx_Proc_destruct(&pmi_->proc_wild);
+    PMIX_PROC_DESTRUCT(&pmi_->proc);
+    PMIX_PROC_DESTRUCT(&pmi_->proc_wild);
     if (!check_pmi(PMIx_Finalize(NULL, 0))) {
         return CLH_PMI_STATUS_ERROR;
     }
@@ -74,7 +74,7 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
     pmix_value_t *pmi_value = NULL;
     pmix_proc_t   proc = {};
 
-    PMIx_Load_procid(&proc, pmi_->proc.nspace, node_id);
+    PMIX_LOAD_PROCID(&proc, pmi_->proc.nspace, node_id);
     if (!check_pmi(PMIx_Get(&proc, key, NULL, 0, &pmi_value))) {
         return CLH_PMI_STATUS_ERROR;
     }
@@ -82,7 +82,7 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
     if (size) {
         *size = pmi_value->data.bo.size;
     }
-    PMIx_Value_destruct(pmi_value);
+    PMIX_VALUE_DESTRUCT(pmi_value);
 
     return CLH_PMI_STATUS_SUCCESS;
 }
@@ -90,14 +90,15 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
 CLH_PMI_Status clh_pmi_fence(CLH_PMI_Handle pmi)
 {
     struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
-    pmix_info_t* info = PMIx_Info_create(1);
+    pmix_info_t* info;
+    PMIX_INFO_CREATE(info, 1);
     bool        collect_data = false;
 
-    PMIx_Info_load(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
     if (!check_pmi(PMIx_Fence(&pmi_->proc_wild, 1, info, 1))) {
         return CLH_PMI_STATUS_ERROR;
     }
-    PMIx_Info_free(info, 1);
+    PMIX_INFO_FREE(info, 1);
 
     return CLH_PMI_STATUS_SUCCESS;
 }
@@ -110,14 +111,15 @@ CLH_PMI_Status clh_pmi_sync(CLH_PMI_Handle pmi)
         return CLH_PMI_STATUS_ERROR;
     }
 
-    pmix_info_t* info = PMIx_Info_create(1);
+    pmix_info_t* info;
+    PMIX_INFO_CREATE(info, 1);
     bool collect_data = true;
 
-    PMIx_Info_load(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
     if (!check_pmi(PMIx_Fence(&pmi_->proc_wild, 1, info, 1))) {
         return CLH_PMI_STATUS_ERROR;
     }
-    PMIx_Info_free(info, 1);
+    PMIX_INFO_FREE(info, 1);
 
     return CLH_PMI_STATUS_SUCCESS;
 }
