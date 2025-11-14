@@ -1,5 +1,8 @@
 #ifndef CLH_ARRAY
 #define CLH_ARRAY
+#include <assert.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 #define Array(ElementType) \
     typedef struct {       \
@@ -35,6 +38,17 @@
         if ((arr).len > 0 || idx < (arr).len) {      \
             (arr).ptr[idx] = (arr).ptr[--(arr).len]; \
         }                                            \
+    } while (false);
+
+#define array_pop(arr, dest, ok)         \
+    do {                                 \
+        if ((arr).len > 0) {             \
+            (arr).len -= 1;              \
+            dest = (arr).ptr[(arr).len]; \
+            ok = true;                   \
+        } else {                         \
+            ok = false;                  \
+        }                                \
     } while (false);
 
 #endif // CLH_ARRAY

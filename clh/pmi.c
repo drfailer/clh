@@ -50,7 +50,7 @@ CLH_PMI_Status clh_pmi_finalize(CLH_PMI_Handle pmi)
     if (!check_pmi(PMIx_Finalize(NULL, 0))) {
         return CLH_PMI_STATUS_ERROR;
     }
-    free(pmi);
+    free(pmi_);
     return CLH_PMI_STATUS_SUCCESS;
 }
 

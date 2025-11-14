@@ -74,6 +74,7 @@ CLH_BufferCache *clh_buffer_cache_create(ucp_context_h context, size_t)
     return cache;
 }
 
+#ifndef CONF_USE_BUFFER_CACHE_NODE_ALLOCATOR
 static bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node)
 {
     if (!node) {
@@ -89,6 +90,7 @@ static bool free_tree_(CLH_BufferCache *cache, CLH_BufferCacheNode *node)
     free(node);
     return result;
 }
+#endif
 
 bool clh_buffer_cache_destroy(CLH_BufferCache *cache)
 {
