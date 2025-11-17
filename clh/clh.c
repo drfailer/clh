@@ -12,11 +12,11 @@ void   clh_release_request_node(CLH_RequestList *list, struct CLH_RequestListNod
 void   clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode *begin,
                                  struct CLH_RequestListNode *end);
 size_t clh_request_list_len(CLH_RequestList *list);
-void clh_request_list_destroy(CLH_RequestList *list);
+void   clh_request_list_destroy(CLH_RequestList *list);
 
 #define CONF_WORKER_WAIT
-// #define CONF_LOOP_SLEEP_TIME 1000
-#define CONF_WARMUP_LOOP_COUNT 100
+// #define CONF_LOOP_SLEEP_TIME 10
+#define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
 #define CONF_USE_SEND_REQUEST_QUEUE
 #define CONF_USE_RECV_REQUEST_QUEUE
@@ -24,7 +24,7 @@ void clh_request_list_destroy(CLH_RequestList *list);
 // #define CONF_UCX_DEQUEUE_ALL
 
 #ifdef CLH_CONF_REQUEST_LIST
-#define request_queue_init(queue) queue.head = NULL
+#define request_queue_init(queue) queue.head = NULL; queue.tail = NULL;
 #define request_queue_destroy(queue) clh_request_list_destroy(&queue)
 #define enqueue_request(queue, request) clh_enqueue_request_node(&queue, request)
 #define request_queue_len(queue) clh_request_list_len(&queue)
@@ -396,10 +396,15 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
         CLH_BufferCacheEntry        bce;                                                        \
         struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;                    \
                                                                                                 \
+        if (handle->request_queues[queue_id].requests.head == NULL) {                           \
+            return status;                                                                      \
+        }                                                                                       \
+                                                                                                \
         CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                                 \
         {                                                                                       \
             first = handle->request_queues[queue_id].requests.head;                             \
             handle->request_queues[queue_id].requests.head = NULL;                              \
+            handle->request_queues[queue_id].requests.tail = NULL;                              \
         }                                                                                       \
         for (cur = first; cur != NULL; cur = cur->next) {                                       \
             CLH_Op op = {.request = cur->request, .status_ptr = NULL};                          \
@@ -516,10 +521,15 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     ucp_tag_message_h msg;
     struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
 
+    if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head == NULL) {
+        return status;
+    }
+
     CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
     {
         first = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head;
         handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head = NULL;
+        handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.tail = NULL;
     }
 
     for (cur = first; cur != NULL; cur = cur->next) {
@@ -738,9 +748,9 @@ CLH_Status clh_init(CLH_Handle *handle)
     (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
     start_(*handle);
 #ifdef CONF_WARMUP_LOOP_COUNT
-    // (*handle)->tracer->enabled = false;
+    TRACER_DISABLE((*handle)->tracer);
     clh_warmup(*handle);
-    // (*handle)->tracer->enabled = true;
+    TRACER_ENABLE((*handle)->tracer);
 #endif
     return CLH_STATUS_SUCCESS;
 }
@@ -1194,12 +1204,15 @@ void clh_enqueue_request_node(CLH_RequestList *list, CLH_Request *request)
 
     node = list->free_nodes;
     list->free_nodes = node->next;
-    node->next = list->head;
-    if (node->next != NULL) {
-        node->next->prev = node;
+
+    node->prev = list->tail;
+    if (node->prev != NULL) {
+        node->prev->next = node;
+    } else {
+        list->head = node;
     }
-    list->head = node;
-    node->prev = NULL;
+    list->tail = node;
+    node->next = NULL;
     node->request = request;
 }
 
@@ -1237,7 +1250,7 @@ void clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode
 
 size_t clh_request_list_len(CLH_RequestList *list)
 {
-    size_t result = 0;
+    size_t                      result = 0;
     struct CLH_RequestListNode *cur;
 
     for (cur = list->head; cur != NULL; cur = cur->next) {

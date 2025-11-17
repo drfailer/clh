@@ -66,6 +66,7 @@ struct CLH_RequestListNode {
 typedef struct {
     CLH_Mutex mutex;
     struct CLH_RequestListNode *head;
+    struct CLH_RequestListNode *tail;
     struct CLH_RequestListNode *free_nodes;
 } CLH_RequestList;
 
