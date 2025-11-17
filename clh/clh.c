@@ -616,21 +616,6 @@ static void terminate_(CLH_Handle handle)
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
-
-    // clang-format off
-#ifdef CONF_PROFILE
-    printf("==================== CLH STATS ====================\n");
-    printf("progress: %.2f ms (count = %ld)\n", handle->stats.run.progress_dur, handle->stats.run.progress_count);
-    printf("process shared queues: %.2f ms (count = %ld)\n", handle->stats.run.process_shared_queues_dur, handle->stats.run.process_shared_queues_count);
-    printf("process request queue: %.2f ms (count = %ld)\n", handle->stats.run.process_requests_dur, handle->stats.run.process_requests_count);
-    printf("register: %.2f ms (count = %ld)\n", handle->stats.cache.register_dur, handle->stats.cache.register_count);
-    printf("send: %.2f ms (count = %ld)\n", handle->stats.comm.send_dur, handle->stats.comm.send_count);
-    printf("recv: %.2f ms (count = %ld)\n", handle->stats.comm.recv_dur, handle->stats.comm.recv_count);
-    printf("probe: %.2f ms (count = %ld)\n", handle->stats.comm.probe_dur, handle->stats.comm.probe_count);
-    printf("probe wait: %.2f ms (count = %ld)\n", handle->stats.comm.probe_wait_dur, handle->stats.comm.probe_wait_count);
-    printf("===================================================\n");
-#endif
-    // clang-format on
 }
 
 /******************************************************************************/
