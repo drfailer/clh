@@ -8,36 +8,14 @@
 #include <time.h>
 
 #define CONF_WORKER_WAIT
-#define CONF_LOOP_SLEEP_TIME 1000
-// #define CONF_PROGRESS_COUNT 100
+// #define CONF_LOOP_SLEEP_TIME 1000
 // #define CONF_PROFILE
+#define CONF_WARMUP_LOOP_COUNT 100
+#define CONF_PROGRESS_COUNT 1
 #define CONF_USE_SEND_REQUEST_QUEUE
 #define CONF_USE_RECV_REQUEST_QUEUE
 #define CONF_USE_PROBE_REQUEST_QUEUE
-
 // #define CONF_UCX_DEQUEUE_ALL
-
-#ifdef CONF_PROFILE
-typedef struct {
-    bool          done;
-    CLH_TimePoint tp_start;
-} CLH_PerfRegionData;
-
-inline CLH_PerfRegionData clh_perf_region_data_start()
-{
-    return (CLH_PerfRegionData){false, clh_perf_tp_get()};
-}
-
-#define CLH_PERF_REGION(handle_, category_, name_)                               \
-    for (CLH_PerfRegionData rd_ = clh_perf_region_data_start(); !rd_.done;       \
-         clh_mutex_lock(&handle_->mutex),                                        \
-                            handle_->stats.category_.name_##_dur                 \
-                            += clh_perf_tp_dur(rd_.tp_start, clh_perf_tp_get()), \
-                            handle_->stats.category_.name_##_count += 1,         \
-                            clh_mutex_unlock(&handle_->mutex), rd_.done = true)
-#else
-#define CLH_PERF_REGION(handle_, category_, name_)
-#endif
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -168,15 +146,15 @@ static inline CLH_Status init_ucp_context_(CLH_Handle handle)
 
 static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
 {
-    ucp_worker_params_t worker_params = {
-        .field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
+    ucp_worker_params_t worker_params
+        = {.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
 #if (defined(CONF_USE_SEND_REQUEST_QUEUE) && defined(CONF_USE_RECV_REQUEST_QUEUE) \
      && defined(CONF_USE_PROBE_REQUEST_QUEUE))
-        .thread_mode = UCS_THREAD_MODE_SINGLE,
+           .thread_mode = UCS_THREAD_MODE_SINGLE,
 #else
-        .thread_mode = UCS_THREAD_MODE_MULTI,
+            .thread_mode = UCS_THREAD_MODE_MULTI,
 #endif
-    };
+          };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
         return CLH_STATUS_ERROR;
     }
@@ -348,96 +326,90 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 /******************************************************************************/
 
 #ifdef CONF_UCX_DEQUEUE_ALL
-#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                           \
-    static CLH_Status func_name(CLH_Handle handle)                                            \
-    {                                                                                         \
-        CLH_Status           status = CLH_STATUS_SUCCESS;                                     \
-        CLH_RequestArray    *queue;                                                           \
-        CLH_BufferCacheEntry bce;                                                             \
-                                                                                              \
-        if (handle->request_queues[queue_id].requests.len == 0) {                             \
-            return status;                                                                    \
-        }                                                                                     \
-                                                                                              \
-        CLH_TRYLOCK_REGION(handle->request_queues[queue_id].mutex)                            \
-        {                                                                                     \
-            queue = &handle->request_queues[queue_id].requests;                               \
-            for (size_t i = 0; i < queue->len; ++i) {                                         \
-                CLH_Op op = {.request = queue->ptr[i], .status_ptr = NULL};                   \
-                CLH_PERF_REGION(handle, cache, register)                                      \
-                {                                                                             \
-                    TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")              \
-                    {                                                                         \
-                        bce = clh_buffer_cache_register_or_get(handle->buffer_cache,          \
-                                                               op.request->data.send.buffer); \
-                        if (bce.mem != op.request->data.send.buffer.mem) {                    \
-                            clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,         \
-                                     op.request->data.send.buffer.mem);                       \
-                            clh_error("UCX", "%s", "registration error (send).");             \
-                            status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;                    \
-                            CLH_EXIT_LOCK_REGION();                                           \
-                        }                                                                     \
-                    }                                                                         \
-                }                                                                             \
-                TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                     \
-                {                                                                             \
-                    op.status_ptr = ucx_func(handle, op.request, bce.memh);                   \
-                }                                                                             \
-                if (!validate_status_ptr_(handle, &op)) {                                     \
-                    clh_error("UCX", "%s", #ucx_func " request failure (send).");             \
-                    status = CLH_STATUS_REQUEST_FAILURE;                                      \
-                    CLH_EXIT_LOCK_REGION();                                                   \
-                }                                                                             \
-            }                                                                                 \
-            queue->len = 0;                                                                   \
-        }                                                                                     \
-        return status;                                                                        \
+#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                       \
+    static CLH_Status func_name(CLH_Handle handle)                                        \
+    {                                                                                     \
+        CLH_Status           status = CLH_STATUS_SUCCESS;                                 \
+        CLH_RequestArray    *queue;                                                       \
+        CLH_BufferCacheEntry bce;                                                         \
+                                                                                          \
+        if (handle->request_queues[queue_id].requests.len == 0) {                         \
+            return status;                                                                \
+        }                                                                                 \
+                                                                                          \
+        CLH_TRYLOCK_REGION(handle->request_queues[queue_id].mutex)                        \
+        {                                                                                 \
+            queue = &handle->request_queues[queue_id].requests;                           \
+            for (size_t i = 0; i < queue->len; ++i) {                                     \
+                CLH_Op op = {.request = queue->ptr[i], .status_ptr = NULL};               \
+                TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")              \
+                {                                                                         \
+                    bce = clh_buffer_cache_register_or_get(handle->buffer_cache,          \
+                                                           op.request->data.send.buffer); \
+                    if (bce.mem != op.request->data.send.buffer.mem) {                    \
+                        clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,         \
+                                 op.request->data.send.buffer.mem);                       \
+                        clh_error("UCX", "%s", "registration error (send).");             \
+                        status = CLH_STATUS_MEMORY_REGISTRATION_ERROR;                    \
+                        CLH_EXIT_LOCK_REGION();                                           \
+                    }                                                                     \
+                }                                                                         \
+                TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                 \
+                {                                                                         \
+                    op.status_ptr = ucx_func(handle, op.request, bce.memh);               \
+                }                                                                         \
+                if (!validate_status_ptr_(handle, &op)) {                                 \
+                    clh_error("UCX", "%s", #ucx_func " request failure (send).");         \
+                    status = CLH_STATUS_REQUEST_FAILURE;                                  \
+                    CLH_EXIT_LOCK_REGION();                                               \
+                }                                                                         \
+            }                                                                             \
+            queue->len = 0;                                                               \
+        }                                                                                 \
+        return status;                                                                    \
     }
 PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
 PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
 #undef PROCESS_SEND_RECV_QUEUE_FUNC
 #else
-#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                   \
-    static CLH_Status func_name(CLH_Handle handle)                                    \
-    {                                                                                 \
-        CLH_Status           status = CLH_STATUS_SUCCESS;                             \
-        CLH_BufferCacheEntry bce;                                                     \
-        CLH_Request *request = NULL;                                                  \
-        bool pop_ok;                                                                  \
-                                                                                      \
-        if (handle->request_queues[queue_id].requests.len == 0) {                     \
-            return status;                                                            \
-        }                                                                             \
-                                                                                      \
-        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                       \
-        {                                                                             \
-            array_pop(handle->request_queues[queue_id].requests, request, pop_ok);    \
-        }                                                                             \
-        assert(pop_ok);                                                               \
-        CLH_Op op = {.request = request, .status_ptr = NULL};                         \
-        CLH_PERF_REGION(handle, cache, register)                                      \
-        {                                                                             \
-            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")              \
-            {                                                                         \
-                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,          \
-                                                       op.request->data.send.buffer); \
-                if (bce.mem != op.request->data.send.buffer.mem) {                    \
-                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,         \
-                             op.request->data.send.buffer.mem);                       \
-                    clh_error("UCX", "%s", "registration error (send).");             \
-                    return CLH_STATUS_MEMORY_REGISTRATION_ERROR;                      \
-                }                                                                     \
-            }                                                                         \
-        }                                                                             \
-        TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                     \
-        {                                                                             \
-            op.status_ptr = ucx_func(handle, op.request, bce.memh);                   \
-        }                                                                             \
-        if (!validate_status_ptr_(handle, &op)) {                                     \
-            clh_error("UCX", "%s", #ucx_func " request failure (send).");             \
-            return CLH_STATUS_REQUEST_FAILURE;                                        \
-        }                                                                             \
-        return status;                                                                \
+#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                \
+    static CLH_Status func_name(CLH_Handle handle)                                 \
+    {                                                                              \
+        CLH_Status           status = CLH_STATUS_SUCCESS;                          \
+        CLH_BufferCacheEntry bce;                                                  \
+        CLH_Request         *request = NULL;                                       \
+        bool                 pop_ok;                                               \
+                                                                                   \
+        if (handle->request_queues[queue_id].requests.len == 0) {                  \
+            return status;                                                         \
+        }                                                                          \
+                                                                                   \
+        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                    \
+        {                                                                          \
+            array_pop(handle->request_queues[queue_id].requests, request, pop_ok); \
+        }                                                                          \
+        assert(pop_ok);                                                            \
+        CLH_Op op = {.request = request, .status_ptr = NULL};                      \
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")               \
+        {                                                                          \
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,           \
+                                                   op.request->data.send.buffer);  \
+            if (bce.mem != op.request->data.send.buffer.mem) {                     \
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,          \
+                         op.request->data.send.buffer.mem);                        \
+                clh_error("UCX", "%s", "registration error (send).");              \
+                return CLH_STATUS_MEMORY_REGISTRATION_ERROR;                       \
+            }                                                                      \
+        }                                                                          \
+        TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                  \
+        {                                                                          \
+            op.status_ptr = ucx_func(handle, op.request, bce.memh);                \
+        }                                                                          \
+        if (!validate_status_ptr_(handle, &op)) {                                  \
+            clh_error("UCX", "%s", #ucx_func " request failure (send).");          \
+            return CLH_STATUS_REQUEST_FAILURE;                                     \
+        }                                                                          \
+        return status;                                                             \
     }
 PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
 PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
@@ -479,14 +451,14 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
 #else
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
-    CLH_Status        status = CLH_STATUS_SUCCESS;
+    CLH_Status status = CLH_STATUS_SUCCESS;
 
     if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0) {
         return status;
     }
-    CLH_Request        *request = NULL;
+    CLH_Request *request = NULL;
     ucp_tag_recv_info_t infos;
-    ucp_tag_message_h   msg;
+    ucp_tag_message_h msg;
     bool pop_ok;
 
     CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
@@ -495,9 +467,8 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
         assert(pop_ok);
     }
 
-    msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
-                           request->data.probe.tag_mask, request->data.probe.remove,
-                           &infos);
+    msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag, request->data.probe.tag_mask,
+                           request->data.probe.remove, &infos);
     complete_request_(request, {
         request->data.probe.result = (msg != NULL);
         request->data.probe.buffer_len = infos.length;
@@ -584,32 +555,27 @@ static void *run_(void *arg)
 
     while (handle->run || !queues_emtpy_(handle)) {
         WORKER_WAIT(handle);
-        CLH_PERF_REGION(handle, run, process_shared_queues)
+        size_t nb_send = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len;
+        size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len;
+        size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len;
+        TRACER_LOCAL_REGION(
+            handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
+            "node = %d,send queue size = %ld,recv queue size = %ld,probe queue size = %ld",
+            clh_node_id(handle), nb_send, nb_recv, nb_probe)
         {
-            size_t nb_send = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len;
-            size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len;
-            size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len;
-            TRACER_LOCAL_REGION(handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
-                    "node = %d,send queue size = %ld,recv queue size = %ld,probe queue size = %ld",
-                    clh_node_id(handle), nb_send, nb_recv, nb_probe)
-            {
-                process_shared_queues_(handle);
-            }
+            process_shared_queues_(handle);
         }
-        CLH_PERF_REGION(handle, run, progress)
+        size_t progress_count = 0;
+        TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker",
+                            "node = %d,progress count = %ld", clh_node_id(handle), progress_count)
         {
-            size_t progress_count = 0;
-            TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker", "node = %d,progress count = %ld", clh_node_id(handle), progress_count)
-            {
-                WORKER_PROGRESS(handle, progress_count);
-            }
+            WORKER_PROGRESS(handle, progress_count);
         }
-        CLH_PERF_REGION(handle, run, process_ops)
+        TRACER_LOCAL_REGION(handle->tracer, "process ops queue,#009BC2FF", "clh.worker",
+                            "node = %d,queue size = %ld", clh_node_id(handle),
+                            handle->ops_queue.len)
         {
-            TRACER_LOCAL_REGION(handle->tracer, "process ops queue,#009BC2FF", "clh.worker", "node = %d,queue size = %ld", clh_node_id(handle), handle->ops_queue.len)
-            {
-                assert(process_ops_queue_(handle) == CLH_STATUS_SUCCESS);
-            }
+            assert(process_ops_queue_(handle) == CLH_STATUS_SUCCESS);
         }
         SLEEP();
     }
@@ -671,6 +637,8 @@ static void terminate_(CLH_Handle handle)
 /*                              init / finalize                               */
 /******************************************************************************/
 
+CLH_Status clh_warmup(CLH_Handle handle);
+
 CLH_Status clh_init(CLH_Handle *handle)
 {
     *handle = calloc(1, sizeof(struct CLH_HandleData));
@@ -687,7 +655,11 @@ CLH_Status clh_init(CLH_Handle *handle)
     (*handle)->request_pool.mutex = clh_mutex_create();
     (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
     start_(*handle);
-
+#ifdef CONF_WARMUP_LOOP_COUNT
+    // (*handle)->tracer->enabled = false;
+    clh_warmup(*handle);
+    // (*handle)->tracer->enabled = true;
+#endif
     return CLH_STATUS_SUCCESS;
 }
 
@@ -708,9 +680,69 @@ CLH_Status clh_finalize(CLH_Handle handle)
     return CLH_STATUS_SUCCESS;
 }
 
-// CLH_Status clh_warmup(CLH_Handle handle) {
-//     // TODO
-// }
+#ifdef CONF_WARMUP_LOOP_COUNT
+#define WARMUP_MSG_SIZE 1024 * 1024
+typedef struct {
+    char str[WARMUP_MSG_SIZE];
+} WarmupMem;
+Array(WarmupMem) WarmupMemArray;
+
+CLH_Status clh_warmup(CLH_Handle handle)
+{
+    CLH_RequestArray send_requests = {0}, recv_requests = {0};
+    WarmupMemArray   recv_mem = {0};
+    char             send_mem[WARMUP_MSG_SIZE], expected_response[WARMUP_MSG_SIZE];
+    clh_u64          node_id = clh_node_id(handle);
+    clh_u64          nb_nodes = clh_nb_nodes(handle);
+
+    array_create(send_requests, CONF_WARMUP_LOOP_COUNT * nb_nodes);
+    array_create(recv_requests, CONF_WARMUP_LOOP_COUNT * nb_nodes);
+    array_create(recv_mem, CONF_WARMUP_LOOP_COUNT * nb_nodes)
+        snprintf(send_mem, WARMUP_MSG_SIZE, "warmup send from %ld", node_id);
+
+    for (size_t i = 0; i < CONF_WARMUP_LOOP_COUNT; ++i) {
+        for (size_t rank = 0; rank < nb_nodes; ++rank) {
+            if (rank == node_id) {
+                continue;
+            }
+            size_t     idx = i * nb_nodes + rank;
+            CLH_Buffer send_buf = {send_mem, WARMUP_MSG_SIZE},
+                       recv_buf = {recv_mem.ptr[idx].str, WARMUP_MSG_SIZE};
+            send_requests.ptr[idx] = clh_send(handle, rank, node_id, send_buf);
+            recv_requests.ptr[idx] = clh_recv(handle, rank, 0xFFFFFFFFFFFFFFFF, recv_buf);
+        }
+    }
+
+    for (size_t i = 0; i < CONF_WARMUP_LOOP_COUNT; ++i) {
+        for (size_t rank = 0; rank < nb_nodes; ++rank) {
+            if (rank == node_id) {
+                continue;
+            }
+            size_t idx = i * nb_nodes + rank;
+            clh_wait(handle, send_requests.ptr[idx]);
+            clh_request_release(handle, send_requests.ptr[idx]);
+        }
+    }
+
+    for (size_t i = 0; i < CONF_WARMUP_LOOP_COUNT; ++i) {
+        for (size_t rank = 0; rank < nb_nodes; ++rank) {
+            if (rank == node_id) {
+                continue;
+            }
+            size_t idx = i * nb_nodes + rank;
+            snprintf(expected_response, WARMUP_MSG_SIZE, "warmup send from %ld", rank);
+            clh_wait(handle, recv_requests.ptr[idx]);
+            clh_request_release(handle, recv_requests.ptr[idx]);
+            assert(strcmp(expected_response, recv_mem.ptr[idx].str) == 0);
+        }
+    }
+
+    array_destroy(send_requests);
+    array_destroy(recv_requests);
+    array_destroy(recv_mem);
+    return CLH_STATUS_SUCCESS;
+}
+#endif
 
 /******************************************************************************/
 /*                          communication functions                           */
@@ -722,21 +754,21 @@ CLH_Status clh_finalize(CLH_Handle handle)
 CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buffer)
 {
     CLH_Request *request = clh_request_get(handle);
+    assert(request != NULL);
     request->type = CLH_REQUEST_TYPE_SEND;
     request->completed = false;
     request->data.send.buffer = buffer;
     request->data.send.tag = tag;
     request->data.send.dest = dest;
-    CLH_PERF_REGION(handle, comm, send)
+    TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op",
+                        "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle),
+                        dest, tag, buffer.mem, buffer.len)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op", "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle), dest, tag, buffer.mem, buffer.len)
+        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
         {
-            CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
-            {
-                array_append(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
-            }
-            WORKER_SIGNAL(handle);
+            array_append(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
         }
+        WORKER_SIGNAL(handle);
     }
     return request;
 }
@@ -744,38 +776,36 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
 CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buffer)
 {
     CLH_BufferCacheEntry bce;
-    CLH_Request         *request = clh_request_get(handle);
+    CLH_Request *request = clh_request_get(handle);
     request->type = CLH_REQUEST_TYPE_SEND;
     request->completed = false;
     request->data.send.buffer = buffer;
     request->data.send.tag = tag;
     request->data.send.dest = dest;
-    CLH_PERF_REGION(handle, comm, send)
+    TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op",
+                        "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle),
+                        dest, tag, buffer.mem, buffer.len)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op", "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle), dest, tag, buffer.mem, buffer.len)
+        CLH_Op op = {.request = request, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
-            CLH_Op op = {.request = request, .status_ptr = NULL};
-            // CLH_PERF_REGION(handle, cache, register)
-            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
-            {
-                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
-                                                       op.request->data.send.buffer);
-                if (bce.mem != op.request->data.send.buffer.mem) {
-                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
-                             op.request->data.send.buffer.mem);
-                    clh_error("UCX", "%s", "registration error (send).");
-                    clh_request_release(handle, request);
-                    return NULL;
-                }
-            }
-            op.status_ptr = ucx_send(handle, op.request, bce.memh);
-            if (!validate_status_ptr_(handle, &op)) {
-                clh_error("UCX", "%s", "ucx_send request failure (send).");
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.send.buffer);
+            if (bce.mem != op.request->data.send.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.send.buffer.mem);
+                clh_error("UCX", "%s", "registration error (send).");
                 clh_request_release(handle, request);
                 return NULL;
             }
-            WORKER_SIGNAL(handle);
         }
+        op.status_ptr = ucx_send(handle, op.request, bce.memh);
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "ucx_send request failure (send).");
+            clh_request_release(handle, request);
+            return NULL;
+        }
+        WORKER_SIGNAL(handle);
     }
     return request;
 }
@@ -787,22 +817,22 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
 CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buffer)
 {
     CLH_Request *request = clh_request_get(handle);
+    assert(request != NULL);
     request->type = CLH_REQUEST_TYPE_RECV;
     request->completed = false;
     request->data.recv.buffer = buffer;
     request->data.recv.tag = tag;
     request->data.recv.tag_mask = tag_mask;
     request->data.recv.msg = NULL;
-    CLH_PERF_REGION(handle, comm, recv)
+    TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op",
+                        "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }",
+                        clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op", "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }", clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
+        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
         {
-            CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-            {
-                array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
-            }
-            WORKER_SIGNAL(handle);
+            array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
         }
+        WORKER_SIGNAL(handle);
     }
     return request;
 }
@@ -819,16 +849,15 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     request->data.recv.tag = tag;
     request->data.recv.tag_mask = 0xFFFFFFFFFFFFFFFF;
     request->data.recv.msg = remove ? msg : NULL;
-    CLH_PERF_REGION(handle, comm, recv)
+    TRACER_LOCAL_REGION(handle->tracer, "request recv,#F5E900FF", "clh.op",
+                        "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag,
+                        remove, msg)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "request recv,#F5E900FF", "clh.op", "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag, remove, msg)
+        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
         {
-            CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-            {
-                array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
-            }
-            WORKER_SIGNAL(handle);
+            array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
         }
+        WORKER_SIGNAL(handle);
     }
     return request;
 }
@@ -836,39 +865,37 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
 CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buffer)
 {
     CLH_BufferCacheEntry bce;
-    CLH_Request         *request = clh_request_get(handle);
+    CLH_Request *request = clh_request_get(handle);
     request->type = CLH_REQUEST_TYPE_RECV;
     request->completed = false;
     request->data.recv.buffer = buffer;
     request->data.recv.tag = tag;
     request->data.recv.tag_mask = tag_mask;
     request->data.recv.msg = NULL;
-    CLH_PERF_REGION(handle, comm, recv)
+    TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op",
+                        "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }",
+                        clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op", "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }", clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
+        CLH_Op op = {.request = request, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
-            CLH_Op op = {.request = request, .status_ptr = NULL};
-            // CLH_PERF_REGION(handle, cache, register)
-            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
-            {
-                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
-                                                       op.request->data.recv.buffer);
-                if (bce.mem != op.request->data.recv.buffer.mem) {
-                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
-                             op.request->data.recv.buffer.mem);
-                    clh_error("UCX", "%s", "registration error (recv).");
-                    clh_request_release(handle, request);
-                    return NULL;
-                }
-            }
-            op.status_ptr = ucx_recv(handle, op.request, bce.memh);
-            if (!validate_status_ptr_(handle, &op)) {
-                clh_error("UCX", "%s", "ucx_recv request failure (recv).");
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.recv.buffer);
+            if (bce.mem != op.request->data.recv.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.recv.buffer.mem);
+                clh_error("UCX", "%s", "registration error (recv).");
                 clh_request_release(handle, request);
                 return NULL;
             }
-            WORKER_SIGNAL(handle);
         }
+        op.status_ptr = ucx_recv(handle, op.request, bce.memh);
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "ucx_recv request failure (recv).");
+            clh_request_release(handle, request);
+            return NULL;
+        }
+        WORKER_SIGNAL(handle);
     }
     return request;
 }
@@ -876,9 +903,9 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
 CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffer buffer)
 {
     CLH_BufferCacheEntry bce;
-    clh_u64              tag = request->data.probe.sender_tag;
-    bool                 remove = request->data.probe.remove;
-    ucp_tag_message_h    msg = request->data.probe.msg;
+    clh_u64 tag = request->data.probe.sender_tag;
+    bool remove = request->data.probe.remove;
+    ucp_tag_message_h msg = request->data.probe.msg;
 
     request->type = CLH_REQUEST_TYPE_RECV;
     request->completed = false;
@@ -886,30 +913,28 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     request->data.recv.tag = tag;
     request->data.recv.tag_mask = 0xFFFFFFFFFFFFFFFF;
     request->data.recv.msg = remove ? msg : NULL;
-    CLH_PERF_REGION(handle, comm, recv)
+    TRACER_LOCAL_REGION(handle->tracer, "request recv,#F5E900FF", "clh.op",
+                        "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag,
+                        remove, msg)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "request recv,#F5E900FF", "clh.op", "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag, remove, msg)
+        CLH_Op op = {.request = request, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
-            CLH_Op op = {.request = request, .status_ptr = NULL};
-            // CLH_PERF_REGION(handle, cache, register)
-            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
-            {
-                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
-                                                       op.request->data.recv.buffer);
-                if (bce.mem != op.request->data.recv.buffer.mem) {
-                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
-                             op.request->data.recv.buffer.mem);
-                    clh_error("UCX", "%s", "registration error (recv).");
-                    clh_request_release(handle, request);
-                    return NULL;
-                }
-            }
-            op.status_ptr = ucx_recv(handle, op.request, bce.memh);
-            if (!validate_status_ptr_(handle, &op)) {
-                clh_error("UCX", "%s", "ucx_recv request failure (recv).");
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.recv.buffer);
+            if (bce.mem != op.request->data.recv.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.recv.buffer.mem);
+                clh_error("UCX", "%s", "registration error (recv).");
                 clh_request_release(handle, request);
                 return NULL;
             }
+        }
+        op.status_ptr = ucx_recv(handle, op.request, bce.memh);
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "ucx_recv request failure (recv).");
+            clh_request_release(handle, request);
+            return NULL;
         }
     }
     return request;
@@ -929,20 +954,18 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     request->data.probe.tag = tag;
     request->data.probe.tag_mask = tag_mask;
     request->data.probe.msg = NULL;
-    CLH_PERF_REGION(handle, comm, probe)
+    TRACER_LOCAL_REGION(handle->tracer, "probe,#00C99AFF", "clh.op",
+                        "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag,
+                        tag_mask, remove)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "probe,#00C99AFF", "clh.op", "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag, tag_mask, remove)
+        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
         {
-            CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
-            {
-                array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
-            }
-            WORKER_SIGNAL(handle);
-            // CLH_PERF_REGION(handle, comm, probe_wait)
-            TRACER_LOCAL_REGION(handle->tracer, "wait,#00C6C9FF", "clh.probe")
-            {
-                clh_wait(handle, request);
-            }
+            array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
+        }
+        WORKER_SIGNAL(handle);
+        TRACER_LOCAL_REGION(handle->tracer, "wait,#00C6C9FF", "clh.probe")
+        {
+            clh_wait(handle, request);
         }
     }
     return request;
@@ -958,19 +981,18 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     request->data.probe.tag = tag;
     request->data.probe.tag_mask = tag_mask;
     request->data.probe.msg = NULL;
-    CLH_PERF_REGION(handle, comm, probe)
+    TRACER_LOCAL_REGION(handle->tracer, "probe,#00C99AFF", "clh.op",
+                        "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag,
+                        tag_mask, remove)
     {
-        TRACER_LOCAL_REGION(handle->tracer, "probe,#00C99AFF", "clh.op", "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag, tag_mask, remove)
-        {
-            ucp_tag_recv_info_t infos;
-            ucp_tag_message_h   msg;
+        ucp_tag_recv_info_t infos;
+        ucp_tag_message_h msg;
 
-            msg = ucp_tag_probe_nb(handle->worker, tag, tag_mask, remove, &infos);
-            request->data.probe.result = (msg != NULL);
-            request->data.probe.buffer_len = infos.length;
-            request->data.probe.sender_tag = infos.sender_tag;
-            request->data.probe.msg = msg;
-        }
+        msg = ucp_tag_probe_nb(handle->worker, tag, tag_mask, remove, &infos);
+        request->data.probe.result = (msg != NULL);
+        request->data.probe.buffer_len = infos.length;
+        request->data.probe.sender_tag = infos.sender_tag;
+        request->data.probe.msg = msg;
     }
     return request;
 }
@@ -982,6 +1004,7 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
 
 CLH_Status clh_wait(CLH_Handle, CLH_Request *request)
 {
+    assert(request != NULL);
     CLH_LOCK_REGION(request->mutex)
     {
         while (!request->completed) {
