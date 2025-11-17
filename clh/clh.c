@@ -7,15 +7,35 @@
 #include <string.h>
 #include <time.h>
 
+void   clh_enqueue_request_node(CLH_RequestList *list, CLH_Request *request);
+void   clh_release_request_node(CLH_RequestList *list, struct CLH_RequestListNode *node);
+void   clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode *begin,
+                                 struct CLH_RequestListNode *end);
+size_t clh_request_list_len(CLH_RequestList *list);
+void clh_request_list_destroy(CLH_RequestList *list);
+
 #define CONF_WORKER_WAIT
 // #define CONF_LOOP_SLEEP_TIME 1000
-// #define CONF_PROFILE
 #define CONF_WARMUP_LOOP_COUNT 100
 #define CONF_PROGRESS_COUNT 1
 #define CONF_USE_SEND_REQUEST_QUEUE
 #define CONF_USE_RECV_REQUEST_QUEUE
 #define CONF_USE_PROBE_REQUEST_QUEUE
 // #define CONF_UCX_DEQUEUE_ALL
+
+#ifdef CLH_CONF_REQUEST_LIST
+#define request_queue_init(queue) queue.head = NULL
+#define request_queue_destroy(queue) clh_request_list_destroy(&queue)
+#define enqueue_request(queue, request) clh_enqueue_request_node(&queue, request)
+#define request_queue_len(queue) clh_request_list_len(&queue)
+#define request_queue_empty(queue) queue.head == NULL
+#else
+#define request_queue_init(queue) array_create(queue, 1024)
+#define request_queue_destroy(queue) array_destroy(queue)
+#define enqueue_request(queue, request) array_append(queue, request)
+#define request_queue_len(queue) queue.len
+#define request_queue_empty(queue) queue.len == 0
+#endif
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -152,7 +172,7 @@ static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
      && defined(CONF_USE_PROBE_REQUEST_QUEUE))
            .thread_mode = UCS_THREAD_MODE_SINGLE,
 #else
-            .thread_mode = UCS_THREAD_MODE_MULTI,
+           .thread_mode = UCS_THREAD_MODE_MULTI,
 #endif
           };
     if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
@@ -325,7 +345,7 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 /*                                    run                                     */
 /******************************************************************************/
 
-#ifdef CONF_UCX_DEQUEUE_ALL
+#if defined(CONF_UCX_DEQUEUE_ALL)
 #define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                       \
     static CLH_Status func_name(CLH_Handle handle)                                        \
     {                                                                                     \
@@ -368,9 +388,48 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
         }                                                                                 \
         return status;                                                                    \
     }
-PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
-PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
-#undef PROCESS_SEND_RECV_QUEUE_FUNC
+#elif defined(CLH_CONF_REQUEST_LIST)
+#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                             \
+    static CLH_Status func_name(CLH_Handle handle)                                              \
+    {                                                                                           \
+        CLH_Status                  status = CLH_STATUS_SUCCESS;                                \
+        CLH_BufferCacheEntry        bce;                                                        \
+        struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;                    \
+                                                                                                \
+        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                                 \
+        {                                                                                       \
+            first = handle->request_queues[queue_id].requests.head;                             \
+            handle->request_queues[queue_id].requests.head = NULL;                              \
+        }                                                                                       \
+        for (cur = first; cur != NULL; cur = cur->next) {                                       \
+            CLH_Op op = {.request = cur->request, .status_ptr = NULL};                          \
+            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")                        \
+            {                                                                                   \
+                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,                    \
+                                                       op.request->data.send.buffer);           \
+                if (bce.mem != op.request->data.send.buffer.mem) {                              \
+                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,                   \
+                             op.request->data.send.buffer.mem);                                 \
+                    clh_error("UCX", "%s", "registration error.");                              \
+                    return CLH_STATUS_MEMORY_REGISTRATION_ERROR;                                \
+                }                                                                               \
+            }                                                                                   \
+            TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                           \
+            {                                                                                   \
+                op.status_ptr = ucx_func(handle, op.request, bce.memh);                         \
+            }                                                                                   \
+            if (!validate_status_ptr_(handle, &op)) {                                           \
+                clh_error("UCX", "%s", #ucx_func " request failure.");                          \
+                return CLH_STATUS_REQUEST_FAILURE;                                              \
+            }                                                                                   \
+            last = cur;                                                                         \
+        }                                                                                       \
+        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                                 \
+        {                                                                                       \
+            clh_release_request_nodes(&handle->request_queues[queue_id].requests, first, last); \
+        }                                                                                       \
+        return status;                                                                          \
+    }
 #else
 #define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                \
     static CLH_Status func_name(CLH_Handle handle)                                 \
@@ -397,7 +456,7 @@ PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_rec
             if (bce.mem != op.request->data.send.buffer.mem) {                     \
                 clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,          \
                          op.request->data.send.buffer.mem);                        \
-                clh_error("UCX", "%s", "registration error (send).");              \
+                clh_error("UCX", "%s", #ucx_func " registration error.");          \
                 return CLH_STATUS_MEMORY_REGISTRATION_ERROR;                       \
             }                                                                      \
         }                                                                          \
@@ -411,12 +470,12 @@ PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_rec
         }                                                                          \
         return status;                                                             \
     }
+#endif
 PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
 PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
 #undef PROCESS_SEND_RECV_QUEUE_FUNC
-#endif
 
-#ifdef CONF_UCX_DEQUEUE_ALL
+#if defined(CONF_UCX_DEQUEUE_ALL)
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
     CLH_Status        status = CLH_STATUS_SUCCESS;
@@ -448,6 +507,41 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     }
     return status;
 }
+#elif defined(CLH_CONF_REQUEST_LIST)
+static CLH_Status process_probe_queue_(CLH_Handle handle)
+{
+    CLH_Status status = CLH_STATUS_SUCCESS;
+    CLH_Request *request = NULL;
+    ucp_tag_recv_info_t infos;
+    ucp_tag_message_h msg;
+    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
+
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
+    {
+        first = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head;
+        handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head = NULL;
+    }
+
+    for (cur = first; cur != NULL; cur = cur->next) {
+        request = cur->request;
+        msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
+                               request->data.probe.tag_mask, request->data.probe.remove, &infos);
+        complete_request_(request, {
+            request->data.probe.result = (msg != NULL);
+            request->data.probe.buffer_len = infos.length;
+            request->data.probe.sender_tag = infos.sender_tag;
+            request->data.probe.msg = msg;
+        });
+        last = cur;
+    }
+
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
+    {
+        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, first,
+                                  last);
+    }
+    return status;
+}
 #else
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
@@ -456,10 +550,10 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
     if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0) {
         return status;
     }
-    CLH_Request *request = NULL;
+    CLH_Request        *request = NULL;
     ucp_tag_recv_info_t infos;
-    ucp_tag_message_h msg;
-    bool pop_ok;
+    ucp_tag_message_h   msg;
+    bool                pop_ok;
 
     CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
     {
@@ -533,13 +627,13 @@ static bool queues_emtpy_(CLH_Handle handle)
 {
     return handle->ops_queue.len == 0
 #if defined(CONF_USE_SEND_REQUEST_QUEUE)
-           && handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len == 0
+           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests)
 #endif
 #if defined(CONF_USE_RECV_REQUEST_QUEUE)
-           && handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len == 0
+           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests)
 #endif
 #if defined(CONF_USE_PROBE_REQUEST_QUEUE)
-           && handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len == 0
+           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests)
 #endif
         ;
 }
@@ -555,9 +649,12 @@ static void *run_(void *arg)
 
     while (handle->run || !queues_emtpy_(handle)) {
         WORKER_WAIT(handle);
-        size_t nb_send = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.len;
-        size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.len;
-        size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.len;
+#ifdef ENABLE_TRACER
+        size_t nb_send = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
+        size_t nb_recv = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
+        size_t nb_probe
+            = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+#endif
         TRACER_LOCAL_REGION(
             handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
             "node = %d,send queue size = %ld,recv queue size = %ld,probe queue size = %ld",
@@ -586,9 +683,9 @@ static void *run_(void *arg)
 
 static void start_(CLH_Handle handle)
 {
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, 1024);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, 1024);
-    array_create(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, 1024);
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
     array_create(handle->ops_queue, 1024);
     handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex = clh_mutex_create();
     handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex = clh_mutex_create();
@@ -609,9 +706,9 @@ static void terminate_(CLH_Handle handle)
     handle->run = false;
     WORKER_SIGNAL(handle);
     clh_thread_join(handle->run_thread);
-    array_destroy(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
-    array_destroy(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
-    array_destroy(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
+    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
+    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
     array_destroy(handle->ops_queue);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
     clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
@@ -751,7 +848,7 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
     {
         CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
         {
-            array_append(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
+            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
         }
         WORKER_SIGNAL(handle);
     }
@@ -815,7 +912,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
     {
         CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
         {
-            array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
+            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
         }
         WORKER_SIGNAL(handle);
     }
@@ -840,7 +937,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     {
         CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
         {
-            array_append(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
+            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
         }
         WORKER_SIGNAL(handle);
     }
@@ -945,7 +1042,7 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     {
         CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
         {
-            array_append(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
+            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
         }
         WORKER_SIGNAL(handle);
         TRACER_LOCAL_REGION(handle->tracer, "wait,#00C6C9FF", "clh.probe")
@@ -1058,11 +1155,13 @@ void clh_request_release(CLH_Handle handle, CLH_Request *request)
     CLH_LOCK_REGION(handle->request_pool.mutex)
     {
         struct CLH_RequestPoolNode *node = (struct CLH_RequestPoolNode *)request;
-        if (node->prev != NULL) {
-            node->prev->next = node->next;
-        }
         if (node->next != NULL) {
             node->next->prev = node->prev;
+        }
+        if (node->prev != NULL) {
+            node->prev->next = node->next;
+        } else {
+            handle->request_pool.used_nodes = node->next;
         }
         node->next = handle->request_pool.free_nodes;
         if (node->next != NULL) {
@@ -1081,6 +1180,83 @@ size_t clh_request_buffer_len(CLH_Request *request)
 clh_u64 clh_request_tag(CLH_Request *request)
 {
     return request->data.probe.sender_tag;
+}
+
+void clh_enqueue_request_node(CLH_RequestList *list, CLH_Request *request)
+{
+    struct CLH_RequestListNode *node = NULL;
+
+    if (list->free_nodes == NULL) {
+        list->free_nodes = malloc(sizeof(*list->free_nodes));
+        list->free_nodes->prev = NULL;
+        list->free_nodes->next = NULL;
+    }
+
+    node = list->free_nodes;
+    list->free_nodes = node->next;
+    node->next = list->head;
+    if (node->next != NULL) {
+        node->next->prev = node;
+    }
+    list->head = node;
+    node->prev = NULL;
+    node->request = request;
+}
+
+void clh_release_request_node(CLH_RequestList *list, struct CLH_RequestListNode *node)
+{
+    if (node->next != NULL) {
+        node->next->prev = node->prev;
+    }
+    if (node->prev != NULL) {
+        node->prev->next = node->next;
+    } else {
+        list->head = node->next;
+    }
+    node->next = list->free_nodes;
+    if (node->next != NULL) {
+        node->next->prev = node;
+    }
+    node->prev = NULL;
+    list->free_nodes = node;
+}
+
+void clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode *begin,
+                               struct CLH_RequestListNode *end)
+{
+    if (begin == NULL || end == NULL) {
+        return;
+    }
+    end->next = list->free_nodes;
+    if (end->next != NULL) {
+        end->next->prev = end;
+    }
+    begin->prev = NULL;
+    list->free_nodes = begin;
+}
+
+size_t clh_request_list_len(CLH_RequestList *list)
+{
+    size_t result = 0;
+    struct CLH_RequestListNode *cur;
+
+    for (cur = list->head; cur != NULL; cur = cur->next) {
+        result += 1;
+    }
+    return result;
+}
+
+void clh_request_list_destroy(CLH_RequestList *list)
+{
+    struct CLH_RequestListNode *cur;
+
+    for (cur = list->head; cur != NULL; cur = cur->next) {
+        free(cur);
+    }
+
+    for (cur = list->free_nodes; cur != NULL; cur = cur->next) {
+        free(cur);
+    }
 }
 
 /******************************************************************************/

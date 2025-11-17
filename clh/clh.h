@@ -8,8 +8,10 @@
 #include "pmi.h"
 #include "thread.h"
 #include <ucp/api/ucp.h>
-#define ENABLE_TRACER
+// #define ENABLE_TRACER
 #include <tracer.h>
+
+#define CLH_CONF_REQUEST_LIST
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,11 +57,27 @@ struct CLH_Request {
     } data;
 };
 
+struct CLH_RequestListNode {
+    CLH_Request *request;
+    struct CLH_RequestListNode *prev;
+    struct CLH_RequestListNode *next;
+};
+
+typedef struct {
+    CLH_Mutex mutex;
+    struct CLH_RequestListNode *head;
+    struct CLH_RequestListNode *free_nodes;
+} CLH_RequestList;
+
 Array(CLH_Request *) CLH_RequestArray;
 
 typedef struct {
     CLH_Mutex        mutex;
+#ifdef CLH_CONF_REQUEST_LIST
+    CLH_RequestList requests;
+#else
     CLH_RequestArray requests;
+#endif
 } CLH_RequestQueue;
 
 struct CLH_RequestPoolNode {
