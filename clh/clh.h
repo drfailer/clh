@@ -56,6 +56,7 @@ struct CLH_Request {
 };
 
 Array(CLH_Request *) CLH_RequestArray;
+
 typedef struct {
     CLH_Mutex        mutex;
     CLH_RequestArray requests;
@@ -64,6 +65,7 @@ typedef struct {
 struct CLH_RequestPoolNode {
     CLH_Request                 request;
     struct CLH_RequestPoolNode *next;
+    struct CLH_RequestPoolNode *prev;
 };
 
 typedef struct {

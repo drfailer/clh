@@ -1058,6 +1058,12 @@ CLH_Request *clh_request_get(CLH_Handle handle)
         } else {
             node = clh_request_pool_node_create();
         }
+        node->next = handle->request_pool.used_nodes;
+        if (node->next != NULL) {
+            node->next->prev = node;
+        }
+        node->prev = NULL;
+        handle->request_pool.used_nodes = node;
     }
     return (CLH_Request *)node;
 }
@@ -1067,7 +1073,17 @@ void clh_request_release(CLH_Handle handle, CLH_Request *request)
     CLH_LOCK_REGION(handle->request_pool.mutex)
     {
         struct CLH_RequestPoolNode *node = (struct CLH_RequestPoolNode *)request;
+        if (node->prev != NULL) {
+            node->prev->next = node->next;
+        }
+        if (node->next != NULL) {
+            node->next->prev = node->prev;
+        }
         node->next = handle->request_pool.free_nodes;
+        if (node->next != NULL) {
+            node->next->prev = node;
+        }
+        node->prev = NULL;
         handle->request_pool.free_nodes = node;
     }
 }
