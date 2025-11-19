@@ -4,6 +4,7 @@
 #include "buffer.h"
 #include "cache.h"
 #include "clh_defs.h"
+#include "mem.h"
 #include "pmi.h"
 #include "thread.h"
 #include <ucp/api/ucp.h>
@@ -55,35 +56,28 @@ struct CLH_Request {
 };
 
 struct CLH_RequestListNode {
-    CLH_Request *request;
+    CLH_Request                *request;
     struct CLH_RequestListNode *prev;
     struct CLH_RequestListNode *next;
 };
 
 typedef struct {
-    CLH_Mutex mutex;
+    CLH_Mutex                   mutex;
     struct CLH_RequestListNode *head;
     struct CLH_RequestListNode *tail;
     struct CLH_RequestListNode *free_nodes;
 } CLH_RequestList;
 
-Array(CLH_Request *) CLH_RequestArray;
-
 typedef struct {
-    CLH_Mutex        mutex;
+    CLH_Mutex       mutex;
     CLH_RequestList requests;
 } CLH_RequestQueue;
 
-struct CLH_RequestPoolNode {
-    CLH_Request                 request;
-    struct CLH_RequestPoolNode *next;
-    struct CLH_RequestPoolNode *prev;
-};
+Array(CLH_Request *) CLH_RequestArray;
 
 typedef struct {
-    CLH_Mutex                   mutex;
-    struct CLH_RequestPoolNode *used_nodes; // TODO
-    struct CLH_RequestPoolNode *free_nodes;
+    CLH_Mutex  mutex;
+    DynMemPool pool;
 } CLH_RequestPool;
 
 typedef struct {
@@ -98,21 +92,39 @@ typedef struct {
 
 Array(CLH_Op) CLH_Ops;
 
+typedef struct CLH_MessageNode {
+    clh_u64                tag;
+    clh_u64                buffer_len;
+    ucp_tag_message_h      msg;
+    struct CLH_MessageNode *next;
+    struct CLH_MessageNode *prev;
+} CLH_MessageNode;
+
+typedef struct {
+    struct CLH_MessageNode *head;
+    struct CLH_MessageNode *tail;
+} CLH_MessageList;
+
+Array(CLH_MessageList) CLH_ChannelsMessages;
+
 struct CLH_HandleData {
-    CLH_PMI_Handle         pmi;
-    ucp_context_h          ucp_context;
-    ucp_worker_h           worker;
-    CLH_Address            address;
-    ucp_ep_h              *endpoints;
-    CLH_BufferCache       *buffer_cache;
-    bool                   run;
-    CLH_Thread             run_thread;
-    CLH_Mutex              mutex;
-    CLH_RequestQueue       request_queues[CLH_NUMBER_REQUEST_TYPES];
-    CLH_Ops                ops_queue;
-    CLH_RequestPool        request_pool;
-    TracerHandle          *tracer;
+    CLH_PMI_Handle          pmi;
+    ucp_context_h           ucp_context;
+    ucp_worker_h            worker;
+    CLH_Address             address;
+    ucp_ep_h               *endpoints;
+    CLH_BufferCache        *buffer_cache;
+    bool                    run;
+    CLH_Thread              run_thread;
+    CLH_Mutex               mutex;
+    CLH_RequestQueue        request_queues[CLH_NUMBER_REQUEST_TYPES];
+    CLH_Ops                 ops_queue;
+    CLH_RequestPool         request_pool;
+    TracerHandle           *tracer;
     CLH_ConditionalVariable init_cv;
+    CLH_ChannelsMessages    expected_messages;
+    CLH_ChannelsMessages    unexpected_messages;
+    DynMemPool              message_node_pool;
 };
 
 typedef enum {
@@ -135,9 +147,6 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
 
 CLH_Status clh_wait(CLH_Handle handle, CLH_Request *request);
 void       clh_cancel(CLH_Handle handle, CLH_Request *request);
-
-struct CLH_RequestPoolNode *clh_request_pool_node_create();
-void                        clh_request_pool_node_destroy(struct CLH_RequestPoolNode *request);
 
 CLH_Request *clh_request_get(CLH_Handle handle);
 void         clh_request_release(CLH_Handle handle, CLH_Request *request);

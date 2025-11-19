@@ -14,6 +14,11 @@ void   clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNo
 size_t clh_request_list_len(CLH_RequestList *list);
 void   clh_request_list_destroy(CLH_RequestList *list);
 
+static void *clh_request_allocator_allocate_(void *, size_t size);
+static void clh_request_allocator_free_(void *, void *ptr);
+
+static clh_u8 channel_from_tag_(clh_u64 tag);
+
 #define CONF_WORKER_WAIT
 #define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
@@ -314,62 +319,171 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 /*                                    run                                     */
 /******************************************************************************/
 
-#define PROCESS_SEND_RECV_QUEUE_FUNC(func_name, queue_id, ucx_func)                             \
-    static CLH_Status func_name(CLH_Handle handle)                                              \
-    {                                                                                           \
-        CLH_Status                  status = CLH_STATUS_SUCCESS;                                \
-        CLH_BufferCacheEntry        bce;                                                        \
-        struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;                    \
-                                                                                                \
-        if (handle->request_queues[queue_id].requests.head == NULL) {                           \
-            return status;                                                                      \
-        }                                                                                       \
-                                                                                                \
-        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                                 \
-        {                                                                                       \
-            first = handle->request_queues[queue_id].requests.head;                             \
-            handle->request_queues[queue_id].requests.head = NULL;                              \
-            handle->request_queues[queue_id].requests.tail = NULL;                              \
-        }                                                                                       \
-        for (cur = first; cur != NULL; cur = cur->next) {                                       \
-            CLH_Op op = {.request = cur->request, .status_ptr = NULL};                          \
-            TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")                        \
-            {                                                                                   \
-                bce = clh_buffer_cache_register_or_get(handle->buffer_cache,                    \
-                                                       op.request->data.send.buffer);           \
-                if (bce.mem != op.request->data.send.buffer.mem) {                              \
-                    clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,                   \
-                             op.request->data.send.buffer.mem);                                 \
-                    clh_error("UCX", "%s", "registration error.");                              \
-                    return CLH_STATUS_MEMORY_REGISTRATION_ERROR;                                \
-                }                                                                               \
-            }                                                                                   \
-            TRACER_LOCAL_REGION(handle->tracer, #ucx_func, "clh.ucx")                           \
-            {                                                                                   \
-                op.status_ptr = ucx_func(handle, op.request, bce.memh);                         \
-            }                                                                                   \
-            if (!validate_status_ptr_(handle, &op)) {                                           \
-                clh_error("UCX", "%s", #ucx_func " request failure.");                          \
-                return CLH_STATUS_REQUEST_FAILURE;                                              \
-            }                                                                                   \
-            last = cur;                                                                         \
-        }                                                                                       \
-        CLH_LOCK_REGION(handle->request_queues[queue_id].mutex)                                 \
-        {                                                                                       \
-            clh_release_request_nodes(&handle->request_queues[queue_id].requests, first, last); \
-        }                                                                                       \
-        return status;                                                                          \
+static void message_add(CLH_Handle handle, CLH_ChannelsMessages lists, clh_u8 channel,
+                        clh_u64 tag, clh_u64 length, ucp_tag_message_h msg)
+{
+    CLH_MessageNode *node = dyn_mem_pool_alloc(&handle->message_node_pool);
+    node->tag = tag;
+    node->buffer_len = length;
+    node->msg = msg;
+
+    node->prev = lists.ptr[channel].tail;
+    node->next = NULL;
+    if (node->prev != NULL) {
+        node->prev->next = node;
+    } else {
+        assert(lists.ptr[channel].head == NULL);
+        lists.ptr[channel].head = node;
     }
-PROCESS_SEND_RECV_QUEUE_FUNC(process_send_queue_, CLH_REQUEST_TYPE_SEND, ucx_send)
-PROCESS_SEND_RECV_QUEUE_FUNC(process_recv_queue_, CLH_REQUEST_TYPE_RECV, ucx_recv)
-#undef PROCESS_SEND_RECV_QUEUE_FUNC
+    lists.ptr[channel].tail = node;
+}
+
+static CLH_MessageNode *message_search(CLH_ChannelsMessages lists, clh_u8 channel, clh_u64 tag, clh_u64 tag_mask)
+{
+    if (lists.len <= channel) {
+        return NULL;
+    }
+
+    CLH_MessageNode *cur = lists.ptr[channel].head;
+
+    for (; cur != NULL; cur = cur->next) {
+        if ((cur->tag & tag_mask) == (tag & tag_mask)) {
+            return cur;
+        }
+    }
+    return NULL;
+}
+
+static void message_remove(CLH_Handle handle, CLH_ChannelsMessages lists, clh_u8 channel,
+                           CLH_MessageNode *msg)
+{
+    if (lists.len <= channel || msg == NULL) {
+        return;
+    }
+
+    if (msg->next != NULL) {
+        msg->next->prev = msg->prev;
+    } else {
+        assert(lists.ptr[channel].tail == msg);
+        lists.ptr[channel].tail = msg->prev;
+    }
+
+    if (msg->prev != NULL) {
+        msg->prev->next = msg->next;
+    } else {
+        assert(lists.ptr[channel].head == msg);
+        lists.ptr[channel].head = msg->next;
+    }
+    dyn_mem_pool_release(&handle->message_node_pool, msg);
+}
+
+static CLH_Status process_send_queue_(CLH_Handle handle)
+{
+    CLH_Status                  status = CLH_STATUS_SUCCESS;
+    CLH_BufferCacheEntry        bce;
+    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
+
+    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head == NULL) {
+        return status;
+    }
+
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
+    {
+        first = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head;
+        handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head = NULL;
+        handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.tail = NULL;
+    }
+    for (cur = first; cur != NULL; cur = cur->next) {
+        CLH_Op op = {.request = cur->request, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
+        {
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.send.buffer);
+            if (bce.mem != op.request->data.send.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.send.buffer.mem);
+                clh_error("UCX", "%s", "registration error.");
+                return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
+            }
+        }
+        TRACER_LOCAL_REGION(handle->tracer, "ucx_send", "clh.ucx")
+        {
+            op.status_ptr = ucx_send(handle, op.request, bce.memh);
+        }
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "send request failure.");
+            return CLH_STATUS_REQUEST_FAILURE;
+        }
+        last = cur;
+    }
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
+    {
+        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, first, last);
+    }
+    return status;
+}
+
+static CLH_Status process_recv_queue_(CLH_Handle handle)
+{
+    CLH_Status                  status = CLH_STATUS_SUCCESS;
+    CLH_BufferCacheEntry        bce;
+    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
+
+    if (handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head == NULL) {
+        return status;
+    }
+
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
+    {
+        first = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head;
+        handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head = NULL;
+        handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.tail = NULL;
+    }
+    for (cur = first; cur != NULL; cur = cur->next) {
+        CLH_Op op = {.request = cur->request, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
+        {
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.recv.buffer);
+            if (bce.mem != op.request->data.recv.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.recv.buffer.mem);
+                clh_error("UCX", "%s", "registration error.");
+                return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
+            }
+        }
+        TRACER_LOCAL_REGION(handle->tracer, "ucx_recv", "clh.ucx")
+        {
+            if (op.request->data.recv.msg == NULL) {
+                clh_u8 channel = channel_from_tag_(cur->request->data.recv.tag);
+                CLH_MessageNode *node = message_search(handle->unexpected_messages, channel,
+                        cur->request->data.recv.tag, cur->request->data.recv.tag_mask);
+                if (node != NULL) {
+                    op.request->data.recv.msg = node->msg;
+                    message_remove(handle, handle->unexpected_messages, channel, node);
+                }
+            }
+            op.status_ptr = ucx_recv(handle, op.request, bce.memh);
+        }
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "recv request failure.");
+            return CLH_STATUS_REQUEST_FAILURE;
+        }
+        last = cur;
+    }
+    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
+    {
+        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, first, last);
+    }
+    return status;
+}
 
 static CLH_Status process_probe_queue_(CLH_Handle handle)
 {
     CLH_Status status = CLH_STATUS_SUCCESS;
     CLH_Request *request = NULL;
     ucp_tag_recv_info_t infos;
-    ucp_tag_message_h msg;
+    ucp_tag_message_h msg = NULL;
     struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
 
     if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head == NULL) {
@@ -385,8 +499,20 @@ static CLH_Status process_probe_queue_(CLH_Handle handle)
 
     for (cur = first; cur != NULL; cur = cur->next) {
         request = cur->request;
-        msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
-                               request->data.probe.tag_mask, request->data.probe.remove, &infos);
+        clh_u8 channel = channel_from_tag_(request->data.probe.tag);
+        CLH_MessageNode *node = message_search(handle->unexpected_messages, channel,
+                request->data.probe.tag, request->data.probe.tag_mask);
+        if (node != NULL) {
+            infos.sender_tag = node->tag;
+            infos.length = node->buffer_len;
+            msg = node->msg;
+            if (request->data.probe.remove) {
+                message_remove(handle, handle->unexpected_messages, channel, node);
+            }
+        } else {
+            msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
+                                   request->data.probe.tag_mask, request->data.probe.remove, &infos);
+        }
         complete_request_(request, {
             request->data.probe.result = (msg != NULL);
             request->data.probe.buffer_len = infos.length;
@@ -456,6 +582,34 @@ static bool queues_emtpy_(CLH_Handle handle)
            && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
 }
 
+static clh_u8 channel_from_tag_(clh_u64 tag)
+{
+    return (tag & 0b0000000000000000000000000000000000000000111111110000000000000000) >> 16;
+}
+
+#define CONF_PROBE_THRESH 1
+static void probe_incomming_messages_(CLH_Handle handle)
+{
+    ucp_tag_message_h msg;
+    ucp_tag_recv_info_t infos;
+    clh_u8 channel = 0;
+
+    for (size_t i = 0; i < CONF_PROBE_THRESH; ++i) {
+        msg = ucp_tag_probe_nb(handle->worker, 0, 0, 1, &infos);
+        if (msg == NULL) {
+            break;
+        }
+        channel = channel_from_tag_(infos.sender_tag);
+        TRACER_ADD_EV(handle->tracer, "new msg", "probe_incomming", "tag = %ld,channel = %d,len = %ld", infos.sender_tag, (int)channel, infos.length);
+        if (handle->unexpected_messages.len < channel + 1) {
+            array_resize(handle->unexpected_messages, channel + 1);
+            handle->unexpected_messages.ptr[channel].head = NULL;
+            handle->unexpected_messages.ptr[channel].tail = NULL;
+        }
+        message_add(handle, handle->unexpected_messages, channel, infos.sender_tag, infos.length, msg);
+    }
+}
+
 static void *run_(void *arg)
 {
     CLH_Handle handle = (CLH_Handle)arg;
@@ -466,6 +620,7 @@ static void *run_(void *arg)
     clh_conditional_variable_notify_one(&handle->init_cv);
 
     while (handle->run || !queues_emtpy_(handle)) {
+        probe_incomming_messages_(handle);
         WORKER_WAIT(handle);
 #ifdef ENABLE_TRACER
         size_t nb_send = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
@@ -552,7 +707,14 @@ CLH_Status clh_init(CLH_Handle *handle)
 
     (*handle)->mutex = clh_mutex_create();
     (*handle)->request_pool.mutex = clh_mutex_create();
-    (*handle)->request_pool = (CLH_RequestPool){{}, NULL, NULL}; // prealloc???
+    dyn_mem_pool_init(&(*handle)->request_pool.pool,
+            .data_size = sizeof(CLH_Request),
+            .backing_alloctor = (Allocator){
+                .allocate = clh_request_allocator_allocate_,
+                .free = clh_request_allocator_free_,
+            },
+            .default_capacity = 10);
+    dyn_mem_pool_init(&(*handle)->message_node_pool, .data_size = sizeof(CLH_MessageNode), .default_capacity = 10);
     start_(*handle);
 #ifdef CONF_WARMUP_LOOP_COUNT
     TRACER_DISABLE((*handle)->tracer);
@@ -569,11 +731,7 @@ CLH_Status clh_finalize(CLH_Handle handle)
     clh_pmi_finalize(handle->pmi);
     clh_mutex_destroy(&handle->mutex);
     clh_mutex_destroy(&handle->request_pool.mutex);
-    for (struct CLH_RequestPoolNode *node = handle->request_pool.free_nodes; node != NULL;) {
-        struct CLH_RequestPoolNode *next = node->next;
-        clh_request_pool_node_destroy(node);
-        node = next;
-    }
+    dyn_mem_pool_destroy(&handle->request_pool.pool);
     TRACER_DESTROY(handle->tracer);
     free(handle);
     return CLH_STATUS_SUCCESS;
@@ -596,8 +754,8 @@ CLH_Status clh_warmup(CLH_Handle handle)
 
     array_create(send_requests, CONF_WARMUP_LOOP_COUNT * nb_nodes);
     array_create(recv_requests, CONF_WARMUP_LOOP_COUNT * nb_nodes);
-    array_create(recv_mem, CONF_WARMUP_LOOP_COUNT * nb_nodes)
-        snprintf(send_mem, WARMUP_MSG_SIZE, "warmup send from %ld", node_id);
+    array_create(recv_mem, CONF_WARMUP_LOOP_COUNT * nb_nodes);
+    snprintf(send_mem, WARMUP_MSG_SIZE, "warmup send from %ld", node_id);
 
     for (size_t i = 0; i < CONF_WARMUP_LOOP_COUNT; ++i) {
         for (size_t rank = 0; rank < nb_nodes; ++rank) {
@@ -607,8 +765,8 @@ CLH_Status clh_warmup(CLH_Handle handle)
             size_t     idx = i * nb_nodes + rank;
             CLH_Buffer send_buf = {send_mem, WARMUP_MSG_SIZE},
                        recv_buf = {recv_mem.ptr[idx].str, WARMUP_MSG_SIZE};
-            send_requests.ptr[idx] = clh_send(handle, rank, node_id, send_buf);
-            recv_requests.ptr[idx] = clh_recv(handle, rank, 0xFFFFFFFFFFFFFFFF, recv_buf);
+            send_requests.ptr[idx] = clh_send(handle, rank, node_id << 32, send_buf);
+            recv_requests.ptr[idx] = clh_recv(handle, rank << 32, 0xFFFFFFFFFFFFFFFF, recv_buf);
         }
     }
 
@@ -782,63 +940,40 @@ bool clh_request_completed(CLH_Handle, CLH_Request *request)
     return request->completed;
 }
 
-struct CLH_RequestPoolNode *clh_request_pool_node_create()
+static void *clh_request_allocator_allocate_(void *, size_t size)
 {
-    struct CLH_RequestPoolNode *node = malloc(sizeof(*node));
-    assert((CLH_Request *)node == &node->request);
-    node->request.mutex = clh_mutex_create();
-    node->request.cv = clh_conditional_variable_create();
+    struct DynMemPoolNode *node = malloc(size);
+    CLH_Request *request = (CLH_Request *)node->data;
+    request->mutex = clh_mutex_create();
+    request->cv = clh_conditional_variable_create();
     return node;
 }
 
-void clh_request_pool_node_destroy(struct CLH_RequestPoolNode *node)
+static void clh_request_allocator_free_(void *, void *ptr)
 {
-    clh_mutex_destroy(&node->request.mutex);
-    clh_conditional_variable_destroy(&node->request.cv);
-    free(node);
+    struct DynMemPoolNode *node = (struct DynMemPoolNode*)ptr;
+    CLH_Request *request = (CLH_Request *)node->data;
+    clh_mutex_destroy(&request->mutex);
+    clh_conditional_variable_destroy(&request->cv);
+    free(ptr);
 }
 
 CLH_Request *clh_request_get(CLH_Handle handle)
 {
-    struct CLH_RequestPoolNode *node = NULL;
+    CLH_Request *request = NULL;
 
     CLH_LOCK_REGION(handle->request_pool.mutex)
     {
-        if (handle->request_pool.free_nodes != NULL) {
-            node = handle->request_pool.free_nodes;
-            handle->request_pool.free_nodes = node->next;
-        } else {
-            node = clh_request_pool_node_create();
-        }
-        node->next = handle->request_pool.used_nodes;
-        if (node->next != NULL) {
-            node->next->prev = node;
-        }
-        node->prev = NULL;
-        handle->request_pool.used_nodes = node;
+        request = (CLH_Request*)dyn_mem_pool_alloc(&handle->request_pool.pool);
     }
-    return (CLH_Request *)node;
+    return request;
 }
 
 void clh_request_release(CLH_Handle handle, CLH_Request *request)
 {
     CLH_LOCK_REGION(handle->request_pool.mutex)
     {
-        struct CLH_RequestPoolNode *node = (struct CLH_RequestPoolNode *)request;
-        if (node->next != NULL) {
-            node->next->prev = node->prev;
-        }
-        if (node->prev != NULL) {
-            node->prev->next = node->next;
-        } else {
-            handle->request_pool.used_nodes = node->next;
-        }
-        node->next = handle->request_pool.free_nodes;
-        if (node->next != NULL) {
-            node->next->prev = node;
-        }
-        node->prev = NULL;
-        handle->request_pool.free_nodes = node;
+        dyn_mem_pool_release(&handle->request_pool.pool, request);
     }
 }
 
