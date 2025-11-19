@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-Wall -Wextra -Wuninitialized -Wno-sign-compare -fdiagnostics-color=auto \
+CFLAGS=-Wall -Wextra -Wuninitialized -Wno-sign-compare -Wno-override-init -fdiagnostics-color=auto \
 	   -I$(HOME)/Programming/usr/include -I/usr/lib/x86_64-linux-gnu/pmix2/include \
 	   -I$(HOME)/Programming/projects/tracer-c/tracer \
 	   -fPIC -g -O3
