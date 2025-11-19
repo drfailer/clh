@@ -51,4 +51,15 @@
         }                                \
     } while (false);
 
+#define array_resize(arr, size)                                             \
+    do {                                                                    \
+        if ((arr).cap < size) {                                             \
+            (arr).cap = size;                                               \
+            (arr).ptr = realloc((arr).ptr, (arr).cap * sizeof(*(arr).ptr)); \
+        }                                                                   \
+        if ((arr).len < size) {                                             \
+            (arr).len = size;                                               \
+        }                                                                   \
+    } while (false);
+
 #endif // CLH_ARRAY
