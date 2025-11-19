@@ -1,6 +1,6 @@
 CC=gcc
 CFLAGS=\
-	   -Wall -Wextra -Wuninitialized -Wno-sign-compare \
+	   -Wall -Wextra -Wuninitialized -Wno-sign-compare -Wno-override-init \
 	   -g \
 	   -fdiagnostics-color=auto \
 	   -I.. \
