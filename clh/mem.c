@@ -5,18 +5,18 @@
 /*                                 allocator                                  */
 /******************************************************************************/
 
-Allocator SYSTEM_ALLOCATOR = {
-    .allocate = system_allocator_allocate,
-    .free = system_allocator_free,
+CLH_Allocator CLH_SYSTEM_ALLOCATOR = {
+    .allocate = clh_system_allocator_allocate,
+    .free = clh_system_allocator_free,
     .data = NULL,
 };
 
-void *system_allocator_allocate(void *, size_t size)
+void *clh_system_allocator_allocate(void *, size_t size)
 {
     return malloc(size);
 }
 
-void system_allocator_free(void *, void *data)
+void clh_system_allocator_free(void *, void *data)
 {
     free(data);
 }
@@ -25,48 +25,46 @@ void system_allocator_free(void *, void *data)
 /*                                dynamic pool                                */
 /******************************************************************************/
 
-void dyn_mem_pool_init_(DynMemPool *pool, struct DynMemPoolInitArgs *args)
+void clh_dyn_mem_pool_init_(CLH_DynMemPool *pool, struct CLH_DynMemPoolInitArgs *args)
 {
     if (args->data_size == 0) {
         fprintf(stderr, "error: dynamic pool requires a data size.\n");
+        return;
     }
     pool->data_size = args->data_size;
     pool->backing_alloctor = args->backing_alloctor;
     pool->free_list = NULL;
     pool->used_list = NULL;
 
-    struct DynMemPoolNode *node = NULL;
+    struct CLH_DynMemPoolNode *node = NULL;
     for (size_t i = 0; i < args->default_capacity; ++i) {
-        node = allocator_allocate(pool->backing_alloctor, 2 * 8 + pool->data_size);
+        node = clh_allocator_allocate(pool->backing_alloctor, sizeof(*node) + pool->data_size);
         node->prev = NULL;
         node->next = pool->free_list;
-        if (node->next != NULL) {
-            node->next->prev = node;
-        }
         pool->free_list = node;
     }
 }
 
-void dyn_mem_pool_destroy(DynMemPool *pool)
+void clh_dyn_mem_pool_destroy(CLH_DynMemPool *pool)
 {
-    struct DynMemPoolNode *cur, *next;
+    struct CLH_DynMemPoolNode *cur, *next;
 
     for (cur = pool->free_list; cur != NULL; cur = next) {
         next = cur->next;
-        allocator_free(pool->backing_alloctor, cur);
+        clh_allocator_free(pool->backing_alloctor, cur);
     }
     for (cur = pool->used_list; cur != NULL; cur = next) {
         next = cur->next;
-        allocator_free(pool->backing_alloctor, cur);
+        clh_allocator_free(pool->backing_alloctor, cur);
     }
 }
 
-void *dyn_mem_pool_alloc(DynMemPool *pool)
+void *clh_dyn_mem_pool_alloc(CLH_DynMemPool *pool)
 {
-    struct DynMemPoolNode *node = NULL;
+    struct CLH_DynMemPoolNode *node = NULL;
 
     if (pool->free_list == NULL) {
-        node = allocator_allocate(pool->backing_alloctor, 2 * 8 + pool->data_size);
+        node = clh_allocator_allocate(pool->backing_alloctor, sizeof(*node) + pool->data_size);
         node->prev = NULL;
         node->next = NULL;
         pool->free_list = node;
@@ -84,9 +82,9 @@ void *dyn_mem_pool_alloc(DynMemPool *pool)
     return node->data;
 }
 
-void dyn_mem_pool_release(DynMemPool *pool, void *data)
+void clh_dyn_mem_pool_release(CLH_DynMemPool *pool, void *data)
 {
-    struct DynMemPoolNode *node = (struct DynMemPoolNode *)(data - 2 * 8);
+    struct CLH_DynMemPoolNode *node = (struct CLH_DynMemPoolNode *)(data - sizeof(*node));
 
     if (node->next != NULL) {
         node->next->prev = node->prev;
@@ -103,21 +101,21 @@ void dyn_mem_pool_release(DynMemPool *pool, void *data)
     pool->free_list = node;
 }
 
-void *dyn_mem_pool_allocate_impl(void *pool, size_t)
+void *clh_dyn_mem_pool_allocate_impl(void *pool, size_t)
 {
-    return dyn_mem_pool_alloc((DynMemPool*)pool);
+    return clh_dyn_mem_pool_alloc((CLH_DynMemPool *)pool);
 }
 
-void dyn_mem_pool_free_impl(void *pool, void *data)
+void clh_dyn_mem_pool_free_impl(void *pool, void *data)
 {
-    dyn_mem_pool_release((DynMemPool*)pool, data);
+    clh_dyn_mem_pool_release((CLH_DynMemPool *)pool, data);
 }
 
-Allocator dyn_mem_pool_allocator(DynMemPool *pool)
+CLH_Allocator clh_dyn_mem_pool_allocator(CLH_DynMemPool *pool)
 {
-    return (Allocator){
-        .allocate = dyn_mem_pool_allocate_impl,
-        .free = dyn_mem_pool_free_impl,
-        .data = (void*)pool,
+    return (CLH_Allocator){
+        .allocate = clh_dyn_mem_pool_allocate_impl,
+        .free = clh_dyn_mem_pool_free_impl,
+        .data = (void *)pool,
     };
 }
