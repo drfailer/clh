@@ -3,6 +3,7 @@
 #include "clh_defs.h"
 #include "mem.h"
 #include "thread.h"
+#include <stdbool.h>
 
 typedef struct CLH_ListNode {
     struct CLH_ListNode *prev;
@@ -42,5 +43,12 @@ void clh_list_release_nodes(CLH_List *list, CLH_ListNode *begin, CLH_ListNode *e
 CLH_ListNode *clh_list_new_node(CLH_List *list);
 void          clh_list_release_node(CLH_List *list, CLH_ListNode *node);
 void          clh_list_release_data(CLH_List *list, void *data);
+
+#define clh_list_node_from_data(data) (CLH_ListNode *)((void*)data - sizeof(CLH_ListNode))
+
+#define clh_list_foreach(type, it, list)      \
+    type *it = NULL;                          \
+    for (CLH_ListNode *it##_cur = list->head; \
+         it##_cur != NULL && (it = (type *)it##_cur->data) != NULL; it##_cur = it##_cur->next)
 
 #endif

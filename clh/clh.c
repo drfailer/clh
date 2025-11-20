@@ -73,10 +73,9 @@ CLH_Status clh_init(CLH_Handle *handle)
     (*handle)->tracer = TRACER_CREATE(trace_file, 0);
 
     (*handle)->mutex = clh_mutex_create();
-    clh_dyn_mem_pool_init(&(*handle)->message_node_pool, .data_size = sizeof(CLH_MessageNode),
-                          .default_capacity = 10);
     for (size_t i = 0; i < CLH_MAX_CHANNELS; ++i) {
-        (*handle)->recv_list[i].mutex = clh_mutex_create();
+        clh_list_init(&(*handle)->recv_list[i], .data_size = sizeof(CLH_Message),
+                      .default_capacity = 10);
     }
     start_(*handle);
 #ifdef CONF_WARMUP_LOOP_COUNT
@@ -93,9 +92,8 @@ CLH_Status clh_finalize(CLH_Handle handle)
     terminate_(handle);
     clh_pmi_finalize(handle->pmi);
     clh_mutex_destroy(&handle->mutex);
-    clh_dyn_mem_pool_destroy(&handle->message_node_pool);
     for (size_t i = 0; i < CLH_MAX_CHANNELS; ++i) {
-        clh_mutex_destroy(&handle->recv_list[i].mutex);
+        clh_list_destroy(&handle->recv_list[i]);
     }
     TRACER_DESTROY(handle->tracer);
     free(handle);
@@ -159,60 +157,16 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 /*                                    run                                     */
 /******************************************************************************/
 
-static void message_add(CLH_Handle handle, CLH_MessageList *list, clh_u64 tag, clh_u64 length,
-                        ucp_tag_message_h msg)
+static CLH_ListNode *message_search(CLH_List *list, clh_u64 tag, clh_u64 tag_mask)
 {
-    CLH_MessageNode *node = clh_dyn_mem_pool_alloc(&handle->message_node_pool);
-    node->tag = tag;
-    node->buffer_len = length;
-    node->msg = msg;
+    CLH_ListNode *result = NULL;
 
     CLH_LOCK_REGION(list->mutex)
     {
-        node->prev = list->tail;
-        node->next = NULL;
-        if (node->prev != NULL) {
-            node->prev->next = node;
-        } else {
-            assert(list->head == NULL);
-            list->head = node;
-        }
-        list->tail = node;
-    }
-}
-
-static void message_remove(CLH_Handle handle, CLH_MessageList *list, CLH_MessageNode *msg)
-{
-    CLH_LOCK_REGION(list->mutex)
-    {
-        if (msg->next != NULL) {
-            msg->next->prev = msg->prev;
-        } else {
-            assert(list->tail == msg);
-            list->tail = msg->prev;
-        }
-
-        if (msg->prev != NULL) {
-            msg->prev->next = msg->next;
-        } else {
-            assert(list->head == msg);
-            list->head = msg->next;
-        }
-    }
-    clh_dyn_mem_pool_release(&handle->message_node_pool, msg);
-}
-
-static CLH_MessageNode *message_search(CLH_MessageList *list, clh_u64 tag, clh_u64 tag_mask)
-{
-    CLH_MessageNode *result = NULL;
-
-    CLH_LOCK_REGION(list->mutex)
-    {
-        CLH_MessageNode *cur = list->head;
-
-        for (; cur != NULL; cur = cur->next) {
-            if ((cur->tag & tag_mask) == (tag & tag_mask)) {
-                result = cur;
+        clh_list_foreach(CLH_Message, msg, list)
+        {
+            if ((msg->sender_tag & tag_mask) == (tag & tag_mask)) {
+                result = msg_cur;
                 break;
             }
         }
@@ -281,13 +235,14 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
             }
         }
         if (op.request->data.recv.msg == NULL) {
-            CLH_Request     *request = (CLH_Request *)cur->data;
-            clh_u8           channel = channel_from_tag_(request->data.recv.tag);
-            CLH_MessageNode *node = message_search(
-                &handle->recv_list[channel], request->data.recv.tag, request->data.recv.tag_mask);
+            CLH_Request  *request = (CLH_Request *)cur->data;
+            clh_u8        channel = channel_from_tag_(request->data.recv.tag);
+            CLH_ListNode *node = message_search(&handle->recv_list[channel], request->data.recv.tag,
+                                                request->data.recv.tag_mask);
             if (node != NULL) {
-                op.request->data.recv.msg = node->msg;
-                message_remove(handle, &handle->recv_list[channel], node);
+                CLH_Message *msg = (CLH_Message *)node->data;
+                op.request->data.recv.msg = msg->msg;
+                clh_list_remove_node(&handle->recv_list[channel], node);
             }
         }
         TRACER_LOCAL_REGION(handle->tracer, "ucx_recv", "clh.ucx")
@@ -334,7 +289,7 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
             array_remove(handle->ops_queue, idx);
             CLH_COMPLETE_REQUEST(request);
         } else {
-            clh_error("UCX", "%s", "request error.");
+            clh_error("UCX", "request error (status = %s)", ucs_status_string(status));
             array_remove(handle->ops_queue, idx);
             return CLH_STATUS_ERROR;
         }
@@ -366,10 +321,11 @@ static void probe_incomming_messages_(CLH_Handle handle)
             break;
         }
         channel = channel_from_tag_(infos.sender_tag);
-        TRACER_ADD_EV(handle->tracer, "new msg", "probe_incomming",
-                      "tag = %ld,channel = %d,len = %ld", infos.sender_tag, (int)channel,
-                      infos.length);
-        message_add(handle, &handle->recv_list[channel], infos.sender_tag, infos.length, msg);
+        clh_list_push_data(&handle->recv_list[channel], &(CLH_Message){
+                                                            .sender_tag = infos.sender_tag,
+                                                            .buffer_len = infos.length,
+                                                            .msg = msg,
+                                                        });
     }
 }
 
@@ -583,7 +539,8 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
                         "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag,
                         remove, msg)
     {
-        clh_list_push_data(&handle->request_queues[CLH_REQUEST_TYPE_RECV], request);
+        clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV],
+                           clh_list_node_from_data(request));
         WORKER_SIGNAL(handle);
     }
     return request;
@@ -606,15 +563,16 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
                         "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag,
                         tag_mask, remove)
     {
-        clh_u8           channel = channel_from_tag_(tag);
-        CLH_MessageNode *node = message_search(&handle->recv_list[channel], tag, tag_mask);
+        clh_u8        channel = channel_from_tag_(tag);
+        CLH_ListNode *node = message_search(&handle->recv_list[channel], tag, tag_mask);
         if (node != NULL) {
+            CLH_Message *msg = (CLH_Message *)node->data;
             request->data.probe.result = true;
-            request->data.probe.sender_tag = node->tag;
-            request->data.probe.buffer_len = node->buffer_len;
-            request->data.probe.msg = node->msg;
+            request->data.probe.sender_tag = msg->sender_tag;
+            request->data.probe.buffer_len = msg->buffer_len;
+            request->data.probe.msg = msg->msg;
             if (remove) {
-                message_remove(handle, &handle->recv_list[channel], node);
+                clh_list_remove_node(&handle->recv_list[channel], node);
             }
         }
     }

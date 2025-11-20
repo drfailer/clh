@@ -1,5 +1,6 @@
 #include "list.h"
 #include <assert.h>
+#include <string.h>
 
 void clh_list_init_(CLH_List *list, struct CLH_ListInitArgs *args)
 {
@@ -40,7 +41,9 @@ void clh_list_destroy(CLH_List *list)
 
 void clh_list_push_data(CLH_List *list, void *data)
 {
-    clh_list_push_node(list, (CLH_ListNode *)(data - sizeof(CLH_ListNode)));
+    CLH_ListNode *node = clh_list_new_node(list);
+    memcpy(node->data, data, list->data_size);
+    clh_list_push_node(list, node);
 }
 
 void clh_list_push_node(CLH_List *list, CLH_ListNode *node)
@@ -97,6 +100,9 @@ void clh_list_remove_node(CLH_List *list, CLH_ListNode *node)
             list->head = node->next;
         }
         list->len -= 1;
+        node->prev = NULL;
+        node->next = list->free_nodes;
+        list->free_nodes = node;
     }
 }
 

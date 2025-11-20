@@ -70,19 +70,11 @@ typedef struct {
 
 Array(CLH_Op) CLH_Ops;
 
-typedef struct CLH_MessageNode {
-    clh_u64                 tag;
-    clh_u64                 buffer_len;
-    ucp_tag_message_h       msg;
-    struct CLH_MessageNode *next;
-    struct CLH_MessageNode *prev;
-} CLH_MessageNode;
-
 typedef struct {
-    CLH_Mutex               mutex;
-    struct CLH_MessageNode *head;
-    struct CLH_MessageNode *tail;
-} CLH_MessageList;
+    clh_u64           sender_tag;
+    clh_u64           buffer_len;
+    ucp_tag_message_h msg;
+} CLH_Message;
 
 #define CLH_MAX_CHANNELS 256
 
@@ -100,8 +92,7 @@ struct CLH_HandleData {
     CLH_Ops                 ops_queue;
     TracerHandle           *tracer;
     CLH_ConditionalVariable init_cv;
-    CLH_MessageList         recv_list[CLH_MAX_CHANNELS];
-    CLH_DynMemPool          message_node_pool;
+    CLH_List                recv_list[CLH_MAX_CHANNELS];
 };
 
 typedef enum {
