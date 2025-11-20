@@ -1,33 +1,22 @@
 #include "clh.h"
 #include "log.h"
 #include "pmi.h"
+#include "ucx.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-void   clh_enqueue_request_node(CLH_RequestList *list, CLH_Request *request);
-void   clh_release_request_node(CLH_RequestList *list, struct CLH_RequestListNode *node);
-void   clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode *begin,
-                                 struct CLH_RequestListNode *end);
-size_t clh_request_list_len(CLH_RequestList *list);
-void   clh_request_list_destroy(CLH_RequestList *list);
-
-static void *clh_request_allocator_allocate_(void *, size_t size);
-static void clh_request_allocator_free_(void *, void *ptr);
+static void *clh_request_allocate_(void *, size_t);
+static void  clh_request_free_(void *, void *ptr);
 
 static clh_u8 channel_from_tag_(clh_u64 tag);
 
 #define CONF_WORKER_WAIT
 #define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
-
-#define request_queue_init(queue) queue.head = NULL; queue.tail = NULL;
-#define request_queue_destroy(queue) clh_request_list_destroy(&queue)
-#define enqueue_request(queue, request) clh_enqueue_request_node(&queue, request)
-#define request_queue_len(queue) clh_request_list_len(&queue)
-#define request_queue_empty(queue) queue.head == NULL
+#define CONF_PROBE_THRESH 1
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -64,6 +53,56 @@ static clh_u8 channel_from_tag_(clh_u64 tag);
 #endif
 
 /******************************************************************************/
+/*                              init / finalize                               */
+/******************************************************************************/
+
+static void       start_(CLH_Handle handle);
+static void       terminate_(CLH_Handle handle);
+static CLH_Status clh_warmup_(CLH_Handle handle);
+
+CLH_Status clh_init(CLH_Handle *handle)
+{
+    *handle = calloc(1, sizeof(struct CLH_HandleData));
+    if (clh_pmi_init(&(*handle)->pmi) != CLH_PMI_STATUS_SUCCESS) {
+        return CLH_STATUS_PMI_ERROR;
+    }
+
+    // we need the rank to determine the name of the tracer output file
+    char trace_file[32] = {0};
+    snprintf(trace_file, sizeof(trace_file), "clh_%d.tr", clh_node_id(*handle));
+    (*handle)->tracer = TRACER_CREATE(trace_file, 0);
+
+    (*handle)->mutex = clh_mutex_create();
+    clh_dyn_mem_pool_init(&(*handle)->message_node_pool, .data_size = sizeof(CLH_MessageNode),
+                          .default_capacity = 10);
+    for (size_t i = 0; i < CLH_MAX_CHANNELS; ++i) {
+        (*handle)->recv_list[i].mutex = clh_mutex_create();
+    }
+    start_(*handle);
+#ifdef CONF_WARMUP_LOOP_COUNT
+    TRACER_DISABLE((*handle)->tracer);
+    clh_warmup_(*handle);
+    TRACER_ENABLE((*handle)->tracer);
+#endif
+    return CLH_STATUS_SUCCESS;
+}
+
+CLH_Status clh_finalize(CLH_Handle handle)
+{
+    clh_pmi_sync(handle->pmi);
+    terminate_(handle);
+    clh_pmi_finalize(handle->pmi);
+    clh_mutex_destroy(&handle->mutex);
+    clh_dyn_mem_pool_destroy(&handle->message_node_pool);
+    for (size_t i = 0; i < CLH_MAX_CHANNELS; ++i) {
+        clh_mutex_destroy(&handle->recv_list[i].mutex);
+    }
+    TRACER_DESTROY(handle->tracer);
+    free(handle);
+    return CLH_STATUS_SUCCESS;
+}
+
+/******************************************************************************/
 /*                                   status                                   */
 /******************************************************************************/
 
@@ -92,176 +131,10 @@ char const *clh_status_string(CLH_Status status)
 }
 
 /******************************************************************************/
-/*                                  handlers                                  */
-/******************************************************************************/
-
-static void failure_handler(void *request, ucp_ep_h ep, ucs_status_t status)
-{
-    fprintf(stderr, "CLH failure handler called: %s {request = %p, ep = %p}\n",
-            ucs_status_string(status), request, ep);
-}
-
-/******************************************************************************/
 /*                            ucx helper functions                            */
 /******************************************************************************/
 
-static CLH_Status ucx_wait(CLH_Handle handle, ucs_status_ptr_t status_ptr)
-{
-    if (UCS_PTR_IS_ERR(status_ptr)) {
-        return CLH_STATUS_REQUEST_FAILURE;
-    }
-
-    if (!UCS_PTR_IS_PTR(status_ptr)) {
-        return CLH_STATUS_SUCCESS;
-    }
-
-    while (true) {
-        ucs_status_t status = ucp_request_check_status(status_ptr);
-
-        if (status == UCS_INPROGRESS) {
-            ucp_worker_progress(handle->worker);
-        } else if (status == UCS_OK) {
-            break;
-        } else {
-            return CLH_STATUS_REQUEST_FAILURE;
-        }
-    }
-    ucp_request_free(status_ptr);
-    return CLH_STATUS_SUCCESS;
-}
-
-static inline CLH_Status init_ucp_context_(CLH_Handle handle)
-{
-    ucp_config_t *ucp_config;
-    if (!check_ucx(ucp_config_read("MPI", NULL, &ucp_config))) {
-        return CLH_STATUS_ERROR;
-    }
-
-    ucp_params_t ucp_params = {
-        .field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_ESTIMATED_NUM_EPS,
-        .features = UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP | UCP_FEATURE_AM,
-        .estimated_num_eps = clh_nb_nodes(handle),
-    };
-    if (!check_ucx(ucp_init(&ucp_params, ucp_config, &handle->ucp_context))) {
-        ucp_config_release(ucp_config);
-        return CLH_STATUS_ERROR;
-    }
-    ucp_config_release(ucp_config);
-    return CLH_STATUS_SUCCESS;
-}
-
-static inline CLH_Status init_ucp_worker_(CLH_Handle handle)
-{
-    ucp_worker_params_t worker_params
-        = {.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE,
-           .thread_mode = UCS_THREAD_MODE_SINGLE,
-          };
-    if (!check_ucx(ucp_worker_create(handle->ucp_context, &worker_params, &handle->worker))) {
-        return CLH_STATUS_ERROR;
-    }
-    return CLH_STATUS_SUCCESS;
-}
-
-static inline CLH_Status init_ucp_endpoints_(CLH_Handle handle)
-{
-    if (!check_ucx(
-            ucp_worker_get_address(handle->worker, &handle->address.data, &handle->address.len))) {
-        return CLH_STATUS_ERROR;
-    }
-    int    this_node_id = clh_node_id(handle);
-    size_t nb_nodes = clh_nb_nodes(handle);
-    char  *key = clh_pmi_make_key(this_node_id);
-    char  *value = clh_pmi_make_value((char *)handle->address.data, handle->address.len);
-    clh_pmi_put(handle->pmi, key, value, handle->address.len);
-    clh_pmi_sync(handle->pmi);
-
-    handle->endpoints = malloc(nb_nodes * sizeof(ucp_ep_h));
-    for (size_t node_id = 0; node_id < nb_nodes; ++node_id) {
-        char peer_addr[1024] = {0};
-
-        if (node_id == (size_t)this_node_id) {
-            continue;
-        }
-
-        key = clh_pmi_make_key(node_id);
-        clh_pmi_get(handle->pmi, node_id, key, peer_addr, NULL);
-
-        ucp_ep_params_t ep_params = {
-            .field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS | UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE
-                          | UCP_EP_PARAM_FIELD_ERR_HANDLER,
-            .address = (ucp_address_t *)peer_addr,
-            .err_mode = UCP_ERR_HANDLING_MODE_PEER,
-            .err_handler.cb = &failure_handler,
-            .err_handler.arg = NULL,
-        };
-        if (!check_ucx(ucp_ep_create(handle->worker, &ep_params, &handle->endpoints[node_id]))) {
-            return CLH_STATUS_ERROR;
-        }
-    }
-    return CLH_STATUS_SUCCESS;
-}
-
-static inline CLH_Status init_cache_(CLH_Handle handle)
-{
-    handle->buffer_cache = clh_buffer_cache_create(handle->ucp_context, 8);
-    if (handle->buffer_cache == NULL) {
-        return CLH_STATUS_ERROR;
-    }
-    return CLH_STATUS_SUCCESS;
-}
-
-static CLH_Status ucx_init(CLH_Handle handle)
-{
-    CLH_Status status = CLH_STATUS_SUCCESS;
-    if ((status = init_ucp_context_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp context.\n");
-        return status;
-    }
-    if ((status = init_ucp_worker_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp worker.\n");
-        return status;
-    }
-    if ((status = init_ucp_endpoints_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp endpoints.\n");
-        return status;
-    }
-    if ((status = init_cache_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init cache.\n");
-        return status;
-    }
-    return status;
-}
-
-static CLH_Status ucx_finalize(CLH_Handle handle)
-{
-    int    this_node_id = clh_node_id(handle);
-    size_t nb_nodes = clh_nb_nodes(handle);
-
-    if (!clh_buffer_cache_destroy(handle->buffer_cache)) {
-        return CLH_STATUS_ERROR;
-    }
-    for (size_t node_id = 0; node_id < nb_nodes; ++node_id) {
-        if (node_id == (size_t)this_node_id) {
-            continue;
-        }
-        ucp_request_param_t params = {
-            .op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS,
-            .flags = UCP_EP_CLOSE_FLAG_FORCE,
-        };
-        ucs_status_ptr_t status_ptr = ucp_ep_close_nbx(handle->endpoints[node_id], &params);
-        if (UCS_PTR_IS_ERR(status_ptr)) {
-            return CLH_STATUS_ERROR;
-        }
-        ucx_wait(handle, status_ptr);
-    }
-    free(handle->endpoints);
-    ucp_worker_release_address(handle->worker, handle->address.data);
-    ucp_worker_destroy(handle->worker);
-    ucp_cleanup(handle->ucp_context);
-    return CLH_STATUS_SUCCESS;
-}
-
-#define complete_request_(request, ...)                    \
+#define CLH_COMPLETE_REQUEST(request, ...)                 \
     do {                                                   \
         clh_mutex_lock(&request->mutex);                   \
         {__VA_ARGS__} request->completed = true;           \
@@ -269,46 +142,13 @@ static CLH_Status ucx_finalize(CLH_Handle handle)
         clh_mutex_unlock(&request->mutex);                 \
     } while (false);
 
-static ucs_status_ptr_t ucx_send(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
-{
-    ucp_request_param_t params = {
-        .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
-        .memh = memh,
-    };
-    return ucp_tag_send_nbx(handle->endpoints[request->data.send.dest],
-                            request->data.send.buffer.mem, request->data.send.buffer.len,
-                            request->data.send.tag, &params);
-}
-
-static ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
-{
-    ucp_request_param_t params = {
-        .op_attr_mask
-        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
-        .datatype = ucp_dt_make_contig(1),
-        .memh = memh,
-    };
-    ucs_status_ptr_t status;
-
-    if (request->data.recv.msg != NULL) {
-        status
-            = ucp_tag_msg_recv_nbx(handle->worker, request->data.recv.buffer.mem,
-                                   request->data.recv.buffer.len, request->data.recv.msg, &params);
-    } else {
-        status = ucp_tag_recv_nbx(handle->worker, request->data.recv.buffer.mem,
-                                  request->data.recv.buffer.len, request->data.recv.tag,
-                                  request->data.recv.tag_mask, &params);
-    }
-    return status;
-}
-
 static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 {
     if (UCS_PTR_IS_ERR(op->status_ptr)) {
         return false;
     }
     if (!UCS_PTR_IS_PTR(op->status_ptr)) {
-        complete_request_(op->request);
+        CLH_COMPLETE_REQUEST(op->request);
     } else {
         array_append(handle->ops_queue, *op);
     }
@@ -319,82 +159,80 @@ static bool validate_status_ptr_(CLH_Handle handle, CLH_Op *op)
 /*                                    run                                     */
 /******************************************************************************/
 
-static void message_add(CLH_Handle handle, CLH_ChannelsMessages lists, clh_u8 channel,
-                        clh_u64 tag, clh_u64 length, ucp_tag_message_h msg)
+static void message_add(CLH_Handle handle, CLH_MessageList *list, clh_u64 tag, clh_u64 length,
+                        ucp_tag_message_h msg)
 {
-    CLH_MessageNode *node = dyn_mem_pool_alloc(&handle->message_node_pool);
+    CLH_MessageNode *node = clh_dyn_mem_pool_alloc(&handle->message_node_pool);
     node->tag = tag;
     node->buffer_len = length;
     node->msg = msg;
 
-    node->prev = lists.ptr[channel].tail;
-    node->next = NULL;
-    if (node->prev != NULL) {
-        node->prev->next = node;
-    } else {
-        assert(lists.ptr[channel].head == NULL);
-        lists.ptr[channel].head = node;
+    CLH_LOCK_REGION(list->mutex)
+    {
+        node->prev = list->tail;
+        node->next = NULL;
+        if (node->prev != NULL) {
+            node->prev->next = node;
+        } else {
+            assert(list->head == NULL);
+            list->head = node;
+        }
+        list->tail = node;
     }
-    lists.ptr[channel].tail = node;
 }
 
-static CLH_MessageNode *message_search(CLH_ChannelsMessages lists, clh_u8 channel, clh_u64 tag, clh_u64 tag_mask)
+static void message_remove(CLH_Handle handle, CLH_MessageList *list, CLH_MessageNode *msg)
 {
-    if (lists.len <= channel) {
-        return NULL;
-    }
+    CLH_LOCK_REGION(list->mutex)
+    {
+        if (msg->next != NULL) {
+            msg->next->prev = msg->prev;
+        } else {
+            assert(list->tail == msg);
+            list->tail = msg->prev;
+        }
 
-    CLH_MessageNode *cur = lists.ptr[channel].head;
-
-    for (; cur != NULL; cur = cur->next) {
-        if ((cur->tag & tag_mask) == (tag & tag_mask)) {
-            return cur;
+        if (msg->prev != NULL) {
+            msg->prev->next = msg->next;
+        } else {
+            assert(list->head == msg);
+            list->head = msg->next;
         }
     }
-    return NULL;
+    clh_dyn_mem_pool_release(&handle->message_node_pool, msg);
 }
 
-static void message_remove(CLH_Handle handle, CLH_ChannelsMessages lists, clh_u8 channel,
-                           CLH_MessageNode *msg)
+static CLH_MessageNode *message_search(CLH_MessageList *list, clh_u64 tag, clh_u64 tag_mask)
 {
-    if (lists.len <= channel || msg == NULL) {
-        return;
-    }
+    CLH_MessageNode *result = NULL;
 
-    if (msg->next != NULL) {
-        msg->next->prev = msg->prev;
-    } else {
-        assert(lists.ptr[channel].tail == msg);
-        lists.ptr[channel].tail = msg->prev;
-    }
+    CLH_LOCK_REGION(list->mutex)
+    {
+        CLH_MessageNode *cur = list->head;
 
-    if (msg->prev != NULL) {
-        msg->prev->next = msg->next;
-    } else {
-        assert(lists.ptr[channel].head == msg);
-        lists.ptr[channel].head = msg->next;
+        for (; cur != NULL; cur = cur->next) {
+            if ((cur->tag & tag_mask) == (tag & tag_mask)) {
+                result = cur;
+                break;
+            }
+        }
     }
-    dyn_mem_pool_release(&handle->message_node_pool, msg);
+    return result;
 }
 
 static CLH_Status process_send_queue_(CLH_Handle handle)
 {
-    CLH_Status                  status = CLH_STATUS_SUCCESS;
-    CLH_BufferCacheEntry        bce;
-    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
+    CLH_Status           status = CLH_STATUS_SUCCESS;
+    CLH_BufferCacheEntry bce;
+    CLH_ListNode        *begin = NULL, *end = NULL, *cur = NULL;
 
-    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head == NULL) {
+    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].head == NULL) {
         return status;
     }
 
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
-    {
-        first = handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head;
-        handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.head = NULL;
-        handle->request_queues[CLH_REQUEST_TYPE_SEND].requests.tail = NULL;
-    }
-    for (cur = first; cur != NULL; cur = cur->next) {
-        CLH_Op op = {.request = cur->request, .status_ptr = NULL};
+    clh_list_get_all_nodes(&handle->request_queues[CLH_REQUEST_TYPE_SEND], &begin, &end);
+    for (cur = begin; cur != NULL; cur = cur->next) {
+        CLH_Op op = {.request = (CLH_Request *)cur->data, .status_ptr = NULL};
         TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
             bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
@@ -414,33 +252,23 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
             clh_error("UCX", "%s", "send request failure.");
             return CLH_STATUS_REQUEST_FAILURE;
         }
-        last = cur;
-    }
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
-    {
-        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, first, last);
     }
     return status;
 }
 
 static CLH_Status process_recv_queue_(CLH_Handle handle)
 {
-    CLH_Status                  status = CLH_STATUS_SUCCESS;
-    CLH_BufferCacheEntry        bce;
-    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
+    CLH_Status           status = CLH_STATUS_SUCCESS;
+    CLH_BufferCacheEntry bce;
+    CLH_ListNode        *begin = NULL, *end = NULL, *cur = NULL;
 
-    if (handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head == NULL) {
+    if (handle->request_queues[CLH_REQUEST_TYPE_RECV].head == NULL) {
         return status;
     }
 
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-    {
-        first = handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head;
-        handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.head = NULL;
-        handle->request_queues[CLH_REQUEST_TYPE_RECV].requests.tail = NULL;
-    }
-    for (cur = first; cur != NULL; cur = cur->next) {
-        CLH_Op op = {.request = cur->request, .status_ptr = NULL};
+    clh_list_get_all_nodes(&handle->request_queues[CLH_REQUEST_TYPE_RECV], &begin, &end);
+    for (cur = begin; cur != NULL; cur = cur->next) {
+        CLH_Op op = {.request = (CLH_Request *)cur->data, .status_ptr = NULL};
         TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
         {
             bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
@@ -452,82 +280,39 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
                 return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
             }
         }
+        if (op.request->data.recv.msg == NULL) {
+            CLH_Request     *request = (CLH_Request *)cur->data;
+            clh_u8           channel = channel_from_tag_(request->data.recv.tag);
+            CLH_MessageNode *node = message_search(
+                &handle->recv_list[channel], request->data.recv.tag, request->data.recv.tag_mask);
+            if (node != NULL) {
+                op.request->data.recv.msg = node->msg;
+                message_remove(handle, &handle->recv_list[channel], node);
+            }
+        }
         TRACER_LOCAL_REGION(handle->tracer, "ucx_recv", "clh.ucx")
         {
-            if (op.request->data.recv.msg == NULL) {
-                clh_u8 channel = channel_from_tag_(cur->request->data.recv.tag);
-                CLH_MessageNode *node = message_search(handle->unexpected_messages, channel,
-                        cur->request->data.recv.tag, cur->request->data.recv.tag_mask);
-                if (node != NULL) {
-                    op.request->data.recv.msg = node->msg;
-                    message_remove(handle, handle->unexpected_messages, channel, node);
-                }
-            }
             op.status_ptr = ucx_recv(handle, op.request, bce.memh);
         }
         if (!validate_status_ptr_(handle, &op)) {
             clh_error("UCX", "%s", "recv request failure.");
             return CLH_STATUS_REQUEST_FAILURE;
         }
-        last = cur;
-    }
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-    {
-        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, first, last);
     }
     return status;
 }
 
-static CLH_Status process_probe_queue_(CLH_Handle handle)
+static inline CLH_Status process_shared_queues_(CLH_Handle handle)
 {
-    CLH_Status status = CLH_STATUS_SUCCESS;
-    CLH_Request *request = NULL;
-    ucp_tag_recv_info_t infos;
-    ucp_tag_message_h msg = NULL;
-    struct CLH_RequestListNode *first = NULL, *last = NULL, *cur = NULL;
-
-    if (handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head == NULL) {
-        return status;
-    }
-
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
+    TRACER_LOCAL_REGION(handle->tracer, "process send queue,#00990CFF", "clh.queues")
     {
-        first = handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head;
-        handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.head = NULL;
-        handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests.tail = NULL;
+        assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
     }
-
-    for (cur = first; cur != NULL; cur = cur->next) {
-        request = cur->request;
-        clh_u8 channel = channel_from_tag_(request->data.probe.tag);
-        CLH_MessageNode *node = message_search(handle->unexpected_messages, channel,
-                request->data.probe.tag, request->data.probe.tag_mask);
-        if (node != NULL) {
-            infos.sender_tag = node->tag;
-            infos.length = node->buffer_len;
-            msg = node->msg;
-            if (request->data.probe.remove) {
-                message_remove(handle, handle->unexpected_messages, channel, node);
-            }
-        } else {
-            msg = ucp_tag_probe_nb(handle->worker, request->data.probe.tag,
-                                   request->data.probe.tag_mask, request->data.probe.remove, &infos);
-        }
-        complete_request_(request, {
-            request->data.probe.result = (msg != NULL);
-            request->data.probe.buffer_len = infos.length;
-            request->data.probe.sender_tag = infos.sender_tag;
-            request->data.probe.msg = msg;
-        });
-        last = cur;
-    }
-
-    CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
+    TRACER_LOCAL_REGION(handle->tracer, "process recv queue,#F5E900FF", "clh.queues")
     {
-        clh_release_request_nodes(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, first,
-                                  last);
+        assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
     }
-    return status;
+    return CLH_STATUS_SUCCESS;
 }
 
 static CLH_Status process_ops_queue_(CLH_Handle handle)
@@ -547,7 +332,7 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
             CLH_Request *request = op->request;
             ucp_request_free(op->status_ptr);
             array_remove(handle->ops_queue, idx);
-            complete_request_(request);
+            CLH_COMPLETE_REQUEST(request);
         } else {
             clh_error("UCX", "%s", "request error.");
             array_remove(handle->ops_queue, idx);
@@ -557,29 +342,11 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
     return CLH_STATUS_SUCCESS;
 }
 
-static inline CLH_Status process_shared_queues_(CLH_Handle handle)
-{
-    TRACER_LOCAL_REGION(handle->tracer, "process probe queue,#00C99AFF", "clh.queues")
-    {
-        assert(process_probe_queue_(handle) == CLH_STATUS_SUCCESS);
-    }
-    TRACER_LOCAL_REGION(handle->tracer, "process send queue,#00990CFF", "clh.queues")
-    {
-        assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
-    }
-    TRACER_LOCAL_REGION(handle->tracer, "process recv queue,#F5E900FF", "clh.queues")
-    {
-        assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
-    }
-    return CLH_STATUS_SUCCESS;
-}
-
 static bool queues_emtpy_(CLH_Handle handle)
 {
-    return handle->ops_queue.len == 0
-           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests)
-           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests)
-           && request_queue_empty(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+    return handle->ops_queue.len == 0 && handle->request_queues[CLH_REQUEST_TYPE_SEND].len == 0
+           && handle->request_queues[CLH_REQUEST_TYPE_RECV].len == 0
+           && handle->request_queues[CLH_REQUEST_TYPE_PROBE].len == 0;
 }
 
 static clh_u8 channel_from_tag_(clh_u64 tag)
@@ -587,12 +354,11 @@ static clh_u8 channel_from_tag_(clh_u64 tag)
     return (tag & 0b0000000000000000000000000000000000000000111111110000000000000000) >> 16;
 }
 
-#define CONF_PROBE_THRESH 1
 static void probe_incomming_messages_(CLH_Handle handle)
 {
-    ucp_tag_message_h msg;
+    ucp_tag_message_h   msg;
     ucp_tag_recv_info_t infos;
-    clh_u8 channel = 0;
+    clh_u8              channel = 0;
 
     for (size_t i = 0; i < CONF_PROBE_THRESH; ++i) {
         msg = ucp_tag_probe_nb(handle->worker, 0, 0, 1, &infos);
@@ -600,13 +366,10 @@ static void probe_incomming_messages_(CLH_Handle handle)
             break;
         }
         channel = channel_from_tag_(infos.sender_tag);
-        TRACER_ADD_EV(handle->tracer, "new msg", "probe_incomming", "tag = %ld,channel = %d,len = %ld", infos.sender_tag, (int)channel, infos.length);
-        if (handle->unexpected_messages.len < channel + 1) {
-            array_resize(handle->unexpected_messages, channel + 1);
-            handle->unexpected_messages.ptr[channel].head = NULL;
-            handle->unexpected_messages.ptr[channel].tail = NULL;
-        }
-        message_add(handle, handle->unexpected_messages, channel, infos.sender_tag, infos.length, msg);
+        TRACER_ADD_EV(handle->tracer, "new msg", "probe_incomming",
+                      "tag = %ld,channel = %d,len = %ld", infos.sender_tag, (int)channel,
+                      infos.length);
+        message_add(handle, &handle->recv_list[channel], infos.sender_tag, infos.length, msg);
     }
 }
 
@@ -623,10 +386,9 @@ static void *run_(void *arg)
         probe_incomming_messages_(handle);
         WORKER_WAIT(handle);
 #ifdef ENABLE_TRACER
-        size_t nb_send = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
-        size_t nb_recv = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
-        size_t nb_probe
-            = request_queue_len(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+        size_t nb_send = handle->request_queues[CLH_REQUEST_TYPE_SEND].len;
+        size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].len;
+        size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].len;
 #endif
         TRACER_LOCAL_REGION(
             handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
@@ -653,15 +415,19 @@ static void *run_(void *arg)
     return 0;
 }
 
+#define request_queue_init(queue, c, a) \
+    clh_list_init(&queue, .data_size = sizeof(CLH_Request), .default_capacity = c, .allocator = a)
+
 static void start_(CLH_Handle handle)
 {
-    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
-    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
-    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+    CLH_Allocator request_allocator = {
+        .allocate = clh_request_allocate_,
+        .free = clh_request_free_,
+    };
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_SEND], 10, request_allocator);
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_RECV], 10, request_allocator);
+    request_queue_init(handle->request_queues[CLH_REQUEST_TYPE_PROBE], 10, request_allocator);
     array_create(handle->ops_queue, 1024);
-    handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex = clh_mutex_create();
-    handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex = clh_mutex_create();
-    handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex = clh_mutex_create();
 
     handle->run = false;
     CLH_Mutex init_mutex = clh_mutex_create();
@@ -678,64 +444,15 @@ static void terminate_(CLH_Handle handle)
     handle->run = false;
     WORKER_SIGNAL(handle);
     clh_thread_join(handle->run_thread);
-    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests);
-    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests);
-    request_queue_destroy(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests);
+    clh_list_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SEND]);
+    clh_list_destroy(&handle->request_queues[CLH_REQUEST_TYPE_RECV]);
+    clh_list_destroy(&handle->request_queues[CLH_REQUEST_TYPE_PROBE]);
     array_destroy(handle->ops_queue);
-    clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex);
-    clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex);
-    clh_mutex_destroy(&handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex);
 }
 
 /******************************************************************************/
-/*                              init / finalize                               */
+/*                                   warmup                                   */
 /******************************************************************************/
-
-CLH_Status clh_warmup(CLH_Handle handle);
-
-CLH_Status clh_init(CLH_Handle *handle)
-{
-    *handle = calloc(1, sizeof(struct CLH_HandleData));
-    if (clh_pmi_init(&(*handle)->pmi) != CLH_PMI_STATUS_SUCCESS) {
-        return CLH_STATUS_PMI_ERROR;
-    }
-
-    // we need the rank to determine the name of the tracer output file
-    char trace_file[32] = {0};
-    snprintf(trace_file, sizeof(trace_file), "clh_%d.tr", clh_node_id(*handle));
-    (*handle)->tracer = TRACER_CREATE(trace_file, 0);
-
-    (*handle)->mutex = clh_mutex_create();
-    (*handle)->request_pool.mutex = clh_mutex_create();
-    dyn_mem_pool_init(&(*handle)->request_pool.pool,
-            .data_size = sizeof(CLH_Request),
-            .backing_alloctor = (Allocator){
-                .allocate = clh_request_allocator_allocate_,
-                .free = clh_request_allocator_free_,
-            },
-            .default_capacity = 10);
-    dyn_mem_pool_init(&(*handle)->message_node_pool, .data_size = sizeof(CLH_MessageNode), .default_capacity = 10);
-    start_(*handle);
-#ifdef CONF_WARMUP_LOOP_COUNT
-    TRACER_DISABLE((*handle)->tracer);
-    clh_warmup(*handle);
-    TRACER_ENABLE((*handle)->tracer);
-#endif
-    return CLH_STATUS_SUCCESS;
-}
-
-CLH_Status clh_finalize(CLH_Handle handle)
-{
-    clh_pmi_sync(handle->pmi);
-    terminate_(handle);
-    clh_pmi_finalize(handle->pmi);
-    clh_mutex_destroy(&handle->mutex);
-    clh_mutex_destroy(&handle->request_pool.mutex);
-    dyn_mem_pool_destroy(&handle->request_pool.pool);
-    TRACER_DESTROY(handle->tracer);
-    free(handle);
-    return CLH_STATUS_SUCCESS;
-}
 
 #ifdef CONF_WARMUP_LOOP_COUNT
 #define WARMUP_MSG_SIZE 1024 * 1024
@@ -744,11 +461,11 @@ typedef struct {
 } WarmupMem;
 Array(WarmupMem) WarmupMemArray;
 
-CLH_Status clh_warmup(CLH_Handle handle)
+static CLH_Status clh_warmup_(CLH_Handle handle)
 {
     CLH_RequestArray send_requests = {0}, recv_requests = {0};
     WarmupMemArray   recv_mem = {0};
-    char             send_mem[WARMUP_MSG_SIZE], expected_response[WARMUP_MSG_SIZE];
+    char             send_mem[WARMUP_MSG_SIZE] = {0}, expected_response[WARMUP_MSG_SIZE] = {0};
     clh_u64          node_id = clh_node_id(handle);
     clh_u64          nb_nodes = clh_nb_nodes(handle);
 
@@ -809,7 +526,8 @@ CLH_Status clh_warmup(CLH_Handle handle)
 
 CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buffer)
 {
-    CLH_Request *request = clh_request_get(handle);
+    CLH_ListNode *node = clh_list_new_node(&handle->request_queues[CLH_REQUEST_TYPE_SEND]);
+    CLH_Request  *request = (CLH_Request *)node->data;
     assert(request != NULL);
     request->type = CLH_REQUEST_TYPE_SEND;
     request->completed = false;
@@ -820,10 +538,7 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
                         "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle),
                         dest, tag, buffer.mem, buffer.len)
     {
-        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_SEND].mutex)
-        {
-            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_SEND].requests, request);
-        }
+        clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_SEND], node);
         WORKER_SIGNAL(handle);
     }
     return request;
@@ -833,7 +548,8 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
 
 CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buffer)
 {
-    CLH_Request *request = clh_request_get(handle);
+    CLH_ListNode *node = clh_list_new_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV]);
+    CLH_Request  *request = (CLH_Request *)node->data;
     assert(request != NULL);
     request->type = CLH_REQUEST_TYPE_RECV;
     request->completed = false;
@@ -845,10 +561,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
                         "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }",
                         clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
     {
-        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-        {
-            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
-        }
+        clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV], node);
         WORKER_SIGNAL(handle);
     }
     return request;
@@ -860,7 +573,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     bool              remove = request->data.probe.remove;
     ucp_tag_message_h msg = request->data.probe.msg;
 
-    request->type = CLH_REQUEST_TYPE_RECV;
+    // we don't change the type so that the request returns to the proper pool
     request->completed = false;
     request->data.recv.buffer = buffer;
     request->data.recv.tag = tag;
@@ -870,10 +583,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
                         "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag,
                         remove, msg)
     {
-        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_RECV].mutex)
-        {
-            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_RECV].requests, request);
-        }
+        clh_list_push_data(&handle->request_queues[CLH_REQUEST_TYPE_RECV], request);
         WORKER_SIGNAL(handle);
     }
     return request;
@@ -883,9 +593,10 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
 
 CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove)
 {
-    CLH_Request *request = clh_request_get(handle);
+    CLH_ListNode *node = clh_list_new_node(&handle->request_queues[CLH_REQUEST_TYPE_PROBE]);
+    CLH_Request  *request = (CLH_Request *)node->data;
     request->type = CLH_REQUEST_TYPE_PROBE;
-    request->completed = false;
+    request->completed = true;
     request->data.probe.result = false;
     request->data.probe.remove = remove;
     request->data.probe.tag = tag;
@@ -895,14 +606,16 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
                         "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag,
                         tag_mask, remove)
     {
-        CLH_LOCK_REGION(handle->request_queues[CLH_REQUEST_TYPE_PROBE].mutex)
-        {
-            enqueue_request(handle->request_queues[CLH_REQUEST_TYPE_PROBE].requests, request);
-        }
-        WORKER_SIGNAL(handle);
-        TRACER_LOCAL_REGION(handle->tracer, "wait,#00C6C9FF", "clh.probe")
-        {
-            clh_wait(handle, request);
+        clh_u8           channel = channel_from_tag_(tag);
+        CLH_MessageNode *node = message_search(&handle->recv_list[channel], tag, tag_mask);
+        if (node != NULL) {
+            request->data.probe.result = true;
+            request->data.probe.sender_tag = node->tag;
+            request->data.probe.buffer_len = node->buffer_len;
+            request->data.probe.msg = node->msg;
+            if (remove) {
+                message_remove(handle, &handle->recv_list[channel], node);
+            }
         }
     }
     return request;
@@ -940,41 +653,38 @@ bool clh_request_completed(CLH_Handle, CLH_Request *request)
     return request->completed;
 }
 
-static void *clh_request_allocator_allocate_(void *, size_t size)
+static void *clh_request_allocate_(void *, size_t size)
 {
-    struct DynMemPoolNode *node = malloc(size);
-    CLH_Request *request = (CLH_Request *)node->data;
+    CLH_ListNode *node = malloc(size);
+    CLH_Request  *request = (CLH_Request *)node->data;
     request->mutex = clh_mutex_create();
     request->cv = clh_conditional_variable_create();
     return node;
 }
 
-static void clh_request_allocator_free_(void *, void *ptr)
+static void clh_request_free_(void *, void *ptr)
 {
-    struct DynMemPoolNode *node = (struct DynMemPoolNode*)ptr;
-    CLH_Request *request = (CLH_Request *)node->data;
+    CLH_ListNode *node = (CLH_ListNode *)ptr;
+    CLH_Request  *request = (CLH_Request *)node->data;
     clh_mutex_destroy(&request->mutex);
     clh_conditional_variable_destroy(&request->cv);
-    free(ptr);
+    free(node);
 }
 
-CLH_Request *clh_request_get(CLH_Handle handle)
-{
-    CLH_Request *request = NULL;
-
-    CLH_LOCK_REGION(handle->request_pool.mutex)
-    {
-        request = (CLH_Request*)dyn_mem_pool_alloc(&handle->request_pool.pool);
-    }
-    return request;
-}
+// CLH_Request *clh_request_get(CLH_Handle handle)
+// {
+//     CLH_Request *request = NULL;
+//
+//     CLH_LOCK_REGION(handle->request_pool.mutex)
+//     {
+//         request = (CLH_Request *)clh_dyn_mem_pool_alloc(&handle->request_pool.pool);
+//     }
+//     return request;
+// }
 
 void clh_request_release(CLH_Handle handle, CLH_Request *request)
 {
-    CLH_LOCK_REGION(handle->request_pool.mutex)
-    {
-        dyn_mem_pool_release(&handle->request_pool.pool, request);
-    }
+    clh_list_release_data(&handle->request_queues[request->type], request);
 }
 
 size_t clh_request_buffer_len(CLH_Request *request)
@@ -985,86 +695,6 @@ size_t clh_request_buffer_len(CLH_Request *request)
 clh_u64 clh_request_tag(CLH_Request *request)
 {
     return request->data.probe.sender_tag;
-}
-
-void clh_enqueue_request_node(CLH_RequestList *list, CLH_Request *request)
-{
-    struct CLH_RequestListNode *node = NULL;
-
-    if (list->free_nodes == NULL) {
-        list->free_nodes = malloc(sizeof(*list->free_nodes));
-        list->free_nodes->prev = NULL;
-        list->free_nodes->next = NULL;
-    }
-
-    node = list->free_nodes;
-    list->free_nodes = node->next;
-
-    node->prev = list->tail;
-    if (node->prev != NULL) {
-        node->prev->next = node;
-    } else {
-        list->head = node;
-    }
-    list->tail = node;
-    node->next = NULL;
-    node->request = request;
-}
-
-void clh_release_request_node(CLH_RequestList *list, struct CLH_RequestListNode *node)
-{
-    if (node->next != NULL) {
-        node->next->prev = node->prev;
-    }
-    if (node->prev != NULL) {
-        node->prev->next = node->next;
-    } else {
-        list->head = node->next;
-    }
-    node->next = list->free_nodes;
-    if (node->next != NULL) {
-        node->next->prev = node;
-    }
-    node->prev = NULL;
-    list->free_nodes = node;
-}
-
-void clh_release_request_nodes(CLH_RequestList *list, struct CLH_RequestListNode *begin,
-                               struct CLH_RequestListNode *end)
-{
-    if (begin == NULL || end == NULL) {
-        return;
-    }
-    end->next = list->free_nodes;
-    if (end->next != NULL) {
-        end->next->prev = end;
-    }
-    begin->prev = NULL;
-    list->free_nodes = begin;
-}
-
-size_t clh_request_list_len(CLH_RequestList *list)
-{
-    size_t                      result = 0;
-    struct CLH_RequestListNode *cur;
-
-    for (cur = list->head; cur != NULL; cur = cur->next) {
-        result += 1;
-    }
-    return result;
-}
-
-void clh_request_list_destroy(CLH_RequestList *list)
-{
-    struct CLH_RequestListNode *cur;
-
-    for (cur = list->head; cur != NULL; cur = cur->next) {
-        free(cur);
-    }
-
-    for (cur = list->free_nodes; cur != NULL; cur = cur->next) {
-        free(cur);
-    }
 }
 
 /******************************************************************************/

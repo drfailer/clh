@@ -4,6 +4,7 @@
 #include "buffer.h"
 #include "cache.h"
 #include "clh_defs.h"
+#include "list.h"
 #include "mem.h"
 #include "pmi.h"
 #include "thread.h"
@@ -55,30 +56,7 @@ struct CLH_Request {
     } data;
 };
 
-struct CLH_RequestListNode {
-    CLH_Request                *request;
-    struct CLH_RequestListNode *prev;
-    struct CLH_RequestListNode *next;
-};
-
-typedef struct {
-    CLH_Mutex                   mutex;
-    struct CLH_RequestListNode *head;
-    struct CLH_RequestListNode *tail;
-    struct CLH_RequestListNode *free_nodes;
-} CLH_RequestList;
-
-typedef struct {
-    CLH_Mutex       mutex;
-    CLH_RequestList requests;
-} CLH_RequestQueue;
-
 Array(CLH_Request *) CLH_RequestArray;
-
-typedef struct {
-    CLH_Mutex  mutex;
-    DynMemPool pool;
-} CLH_RequestPool;
 
 typedef struct {
     ucp_address_t *data;
@@ -93,19 +71,20 @@ typedef struct {
 Array(CLH_Op) CLH_Ops;
 
 typedef struct CLH_MessageNode {
-    clh_u64                tag;
-    clh_u64                buffer_len;
-    ucp_tag_message_h      msg;
+    clh_u64                 tag;
+    clh_u64                 buffer_len;
+    ucp_tag_message_h       msg;
     struct CLH_MessageNode *next;
     struct CLH_MessageNode *prev;
 } CLH_MessageNode;
 
 typedef struct {
+    CLH_Mutex               mutex;
     struct CLH_MessageNode *head;
     struct CLH_MessageNode *tail;
 } CLH_MessageList;
 
-Array(CLH_MessageList) CLH_ChannelsMessages;
+#define CLH_MAX_CHANNELS 256
 
 struct CLH_HandleData {
     CLH_PMI_Handle          pmi;
@@ -117,14 +96,12 @@ struct CLH_HandleData {
     bool                    run;
     CLH_Thread              run_thread;
     CLH_Mutex               mutex;
-    CLH_RequestQueue        request_queues[CLH_NUMBER_REQUEST_TYPES];
+    CLH_List                request_queues[CLH_NUMBER_REQUEST_TYPES];
     CLH_Ops                 ops_queue;
-    CLH_RequestPool         request_pool;
     TracerHandle           *tracer;
     CLH_ConditionalVariable init_cv;
-    CLH_ChannelsMessages    expected_messages;
-    CLH_ChannelsMessages    unexpected_messages;
-    DynMemPool              message_node_pool;
+    CLH_MessageList         recv_list[CLH_MAX_CHANNELS];
+    CLH_DynMemPool          message_node_pool;
 };
 
 typedef enum {
