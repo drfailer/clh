@@ -72,10 +72,9 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
 {
     struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
     pmix_value_t *pmi_value = NULL;
-    pmix_proc_t   proc = {};
 
-    PMIX_LOAD_PROCID(&proc, pmi_->proc.nspace, node_id);
-    if (!check_pmi(PMIx_Get(&proc, key, NULL, 0, &pmi_value))) {
+    PMIX_LOAD_PROCID(&pmi_->proc, pmi_->proc.nspace, node_id);
+    if (!check_pmi(PMIx_Get(&pmi_->proc, key, NULL, 0, &pmi_value))) {
         return CLH_PMI_STATUS_ERROR;
     }
     memcpy(value, pmi_value->data.bo.bytes, pmi_value->data.bo.size);
