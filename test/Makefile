@@ -14,5 +14,13 @@ LDFLAGS=-L$(HOME)/Programming/usr/lib -lucp -lucs \
 prog: main.c ../clh/*.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+memcheck: prog
+	mpirun -n 2 \
+		valgrind \
+		--suppressions=/usr/lib/x86_64-linux-gnu/pmix2/share/pmix/pmix-valgrind.supp \
+		--leak-check=full \
+		--track-origins=yes \
+		prog
+
 clean:
 	rm -rf build
