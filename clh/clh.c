@@ -17,6 +17,7 @@ static clh_u8 channel_from_tag_(clh_u64 tag);
 #define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
 #define CONF_PROBE_THRESH 1
+// #define CONF_SEND_THRESH 32
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -179,6 +180,12 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
     CLH_Status           status = CLH_STATUS_SUCCESS;
     CLH_BufferCacheEntry bce;
     CLH_ListNode        *begin = NULL, *end = NULL, *cur = NULL;
+
+#ifdef CONF_SEND_THRESH
+    if (handle->ops_queue.len > CONF_SEND_THRESH) {
+        return status;
+    }
+#endif
 
     if (handle->request_queues[CLH_REQUEST_TYPE_SEND].head == NULL) {
         return status;
