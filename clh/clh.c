@@ -353,21 +353,21 @@ static void *run_(void *arg)
         size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].len;
         size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].len;
 #endif
-        TRACER_LOCAL_REGION(
-            handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
-            "node = %d,send queue size = %ld,recv queue size = %ld,probe queue size = %ld",
-            clh_node_id(handle), nb_send, nb_recv, nb_probe)
+        TRACER_LOCAL_REGION(handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
+                            "node = %d\nsend queue size = %ld\nrecv queue size = "
+                            "%ld\nprobe queue size = %ld",
+                            clh_node_id(handle), nb_send, nb_recv, nb_probe)
         {
             process_shared_queues_(handle);
         }
         size_t progress_count = 0;
         TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker",
-                            "node = %d,progress count = %ld", clh_node_id(handle), progress_count)
+                            "node = %d\nprogress count = %ld", clh_node_id(handle), progress_count)
         {
             WORKER_PROGRESS(handle, progress_count);
         }
         TRACER_LOCAL_REGION(handle->tracer, "process ops queue,#009BC2FF", "clh.worker",
-                            "node = %d,queue size = %ld", clh_node_id(handle),
+                            "node = %d\nqueue size = %ld", clh_node_id(handle),
                             handle->ops_queue.len)
         {
             assert(process_ops_queue_(handle) == CLH_STATUS_SUCCESS);
@@ -498,8 +498,8 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer b
     request->data.send.tag = tag;
     request->data.send.dest = dest;
     TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op",
-                        "node = %d,dest = %d,tag = %ld,buffer = { %p %ld }", clh_node_id(handle),
-                        dest, tag, buffer.mem, buffer.len)
+                        "node = %d\ndest = %d\ntag = %ld\nbuffer = { %p; %ld }",
+                        clh_node_id(handle), dest, tag, buffer.mem, buffer.len)
     {
         clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_SEND], node);
         WORKER_SIGNAL(handle);
@@ -521,7 +521,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buff
     request->data.recv.tag_mask = tag_mask;
     request->data.recv.msg = NULL;
     TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op",
-                        "node = %d,tag = %ld,tag_mask = %ld,buffer = { %p %ld }",
+                        "node = %d\ntag = %ld\ntag_mask = %ld\nbuffer = { %p; %ld }",
                         clh_node_id(handle), tag, tag_mask, buffer.mem, buffer.len)
     {
         clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV], node);
@@ -543,7 +543,7 @@ CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffe
     request->data.recv.tag_mask = 0xFFFFFFFFFFFFFFFF;
     request->data.recv.msg = remove ? msg : NULL;
     TRACER_LOCAL_REGION(handle->tracer, "request recv,#F5E900FF", "clh.op",
-                        "node = %d,tag = %ld,remove = %d,msg = %p", clh_node_id(handle), tag,
+                        "node = %d\ntag = %ld\nremove = %d\nmsg = %p", clh_node_id(handle), tag,
                         remove, msg)
     {
         clh_list_push_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV],
@@ -567,8 +567,8 @@ CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool re
     request->data.probe.tag_mask = tag_mask;
     request->data.probe.msg = NULL;
     TRACER_LOCAL_REGION(handle->tracer, "probe,#00C99AFF", "clh.op",
-                        "node = %d,tag = %ld,tag_mask = %ld,remove = %d", clh_node_id(handle), tag,
-                        tag_mask, remove)
+                        "node = %d\ntag = %ld\ntag_mask = %ld\nremove = %d", clh_node_id(handle),
+                        tag, tag_mask, remove)
     {
         clh_u8        channel = channel_from_tag_(tag);
         CLH_ListNode *node = message_search(&handle->recv_list[channel], tag, tag_mask);
