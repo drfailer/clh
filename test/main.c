@@ -16,7 +16,10 @@ int main(int, char **)
         for (size_t i = 1; i < clh_nb_nodes(clh); ++i) {
             CLH_Request *request = clh_recv(clh, 0, 0, (CLH_Buffer){message, 1024});
             assert(request);
-            clh_wait(clh, request);
+            TRACER_LOCAL_REGION(clh->tracer, "recv wait,#FF0000FF", "main")
+            {
+                clh_wait(clh, request);
+            }
             printf("message received: `%s`\n", message);
             clh_request_release(clh, request);
         }
@@ -24,7 +27,10 @@ int main(int, char **)
         sprintf(message, "Hello from rank = %d", clh_node_id(clh));
         CLH_Request *request = clh_send(clh, 0, 0, (CLH_Buffer){message, strlen(message) + 1});
         assert(request);
-        clh_wait(clh, request);
+        TRACER_LOCAL_REGION(clh->tracer, "send wait,#00FF00FF", "main")
+        {
+            clh_wait(clh, request);
+        }
         clh_request_release(clh, request);
     }
 
