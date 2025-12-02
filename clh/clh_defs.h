@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -20,7 +20,7 @@ typedef uint16_t clh_u16;
 typedef uint32_t clh_u32;
 typedef uint64_t clh_u64;
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 

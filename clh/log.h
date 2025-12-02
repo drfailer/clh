@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <ucp/api/ucp.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -25,7 +25,7 @@ char const *clh_log_level_string(CLH_LogLevel level);
 bool check_ucx_(ucs_status_t status, char const *filename, size_t line);
 #define check_ucx(status) check_ucx_(status, __FILE__, __LINE__)
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 

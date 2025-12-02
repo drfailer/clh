@@ -3,7 +3,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -38,7 +38,7 @@ bool clh_trylock_region_end(CLH_Mutex *mutex);
     for (bool done = clh_trylock_region_init(&mutex_); !done; done = clh_lock_region_end(&mutex_))
 #define CLH_EXIT_LOCK_REGION() continue
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 

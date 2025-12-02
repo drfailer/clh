@@ -5,7 +5,7 @@
 #include "thread.h"
 #include <ucp/api/ucp.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -49,7 +49,7 @@ CLH_BufferCacheEntry clh_buffer_cache_register_or_get(CLH_BufferCache *cache, CL
 bool                 clh_buffer_cache_unregister(CLH_BufferCache *cache, CLH_Buffer buffer);
 bool                 clh_buffer_cache_is_registered(CLH_BufferCache *cache, CLH_Buffer buffer);
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 

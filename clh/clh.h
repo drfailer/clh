@@ -12,7 +12,7 @@
 // #define ENABLE_TRACER
 #include <tracer.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -127,7 +127,7 @@ void    clh_barrier(CLH_Handle handle);
 clh_i32 clh_node_id(CLH_Handle handle);
 clh_u32 clh_nb_nodes(CLH_Handle handle);
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 
