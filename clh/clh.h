@@ -108,7 +108,7 @@ char const *clh_status_string(CLH_Status status);
 CLH_Status clh_init(CLH_Handle *handle);
 CLH_Status clh_finalize(CLH_Handle handle);
 
-CLH_Request *clh_send(CLH_Handle handle, clh_u32 node_id, clh_u64 tag, CLH_Buffer buf);
+CLH_Request *clh_send(CLH_Handle handle, clh_u32 dest, clh_u64 tag, CLH_Buffer buf);
 CLH_Request *clh_recv(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, CLH_Buffer buf);
 CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *probe_request, CLH_Buffer buf);
 CLH_Request *clh_probe(CLH_Handle handle, clh_u64 tag, clh_u64 tag_mask, bool remove);
