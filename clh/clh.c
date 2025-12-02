@@ -13,7 +13,10 @@ static void  clh_request_free_(void *, void *ptr);
 
 static clh_u8 channel_from_tag_(clh_u64 tag);
 
-#define CONF_WORKER_WAIT
+// FIXME: since we are probing message manually, we should not put the worker
+//        in pause as the run loop should keep looking for incomming messages.
+//        We should still find a way to optimize the loop.
+// #define CONF_WORKER_WAIT
 #define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
 #define CONF_PROBE_THRESH 1
