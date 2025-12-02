@@ -85,7 +85,7 @@ struct CLH_HandleData {
     CLH_Address             address;
     ucp_ep_h               *endpoints;
     CLH_BufferCache        *buffer_cache;
-    bool                    run;
+    volatile bool           run;
     CLH_Thread              run_thread;
     CLH_Mutex               mutex;
     CLH_List                request_queues[CLH_NUMBER_REQUEST_TYPES];
