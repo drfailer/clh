@@ -269,11 +269,13 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
 
 static inline CLH_Status process_shared_queues_(CLH_Handle handle)
 {
-    TRACER_LOCAL_REGION(handle->tracer, "process send queue,#00990CFF", "clh.queues")
+    TRACER_LOCAL_REGION_CND(handle->request_queues[CLH_REQUEST_TYPE_SEND].head != NULL,
+                            handle->tracer, "process send queue,#00990CFF", "clh.queues")
     {
         assert(process_send_queue_(handle) == CLH_STATUS_SUCCESS);
     }
-    TRACER_LOCAL_REGION(handle->tracer, "process recv queue,#F5E900FF", "clh.queues")
+    TRACER_LOCAL_REGION_CND(handle->request_queues[CLH_REQUEST_TYPE_RECV].head != NULL,
+                            handle->tracer, "process recv queue,#F5E900FF", "clh.queues")
     {
         assert(process_recv_queue_(handle) == CLH_STATUS_SUCCESS);
     }
@@ -356,22 +358,24 @@ static void *run_(void *arg)
         size_t nb_recv = handle->request_queues[CLH_REQUEST_TYPE_RECV].len;
         size_t nb_probe = handle->request_queues[CLH_REQUEST_TYPE_PROBE].len;
 #endif
-        TRACER_LOCAL_REGION(handle->tracer, "process shared queues,#F7C48BFF", "clh.worker",
-                            "node = %d\nsend queue size = %ld\nrecv queue size = "
-                            "%ld\nprobe queue size = %ld",
-                            clh_node_id(handle), nb_send, nb_recv, nb_probe)
+        TRACER_LOCAL_REGION_CND(!queues_emtpy_(handle), handle->tracer,
+                                "process shared queues,#F7C48BFF", "clh.worker",
+                                "node = %d\nsend queue size = %ld\nrecv queue size = "
+                                "%ld\nprobe queue size = %ld",
+                                clh_node_id(handle), nb_send, nb_recv, nb_probe)
         {
             process_shared_queues_(handle);
         }
         size_t progress_count = 0;
-        TRACER_LOCAL_REGION(handle->tracer, "progress worker,#CC0000FF", "clh.worker",
-                            "node = %d\nprogress count = %ld", clh_node_id(handle), progress_count)
+        TRACER_LOCAL_REGION_CND(progress_count > 0, handle->tracer, "progress worker,#CC0000FF",
+                                "clh.worker", "node = %d\nprogress count = %ld",
+                                clh_node_id(handle), progress_count)
         {
             WORKER_PROGRESS(handle, progress_count);
         }
-        TRACER_LOCAL_REGION(handle->tracer, "process ops queue,#009BC2FF", "clh.worker",
-                            "node = %d\nqueue size = %ld", clh_node_id(handle),
-                            handle->ops_queue.len)
+        TRACER_LOCAL_REGION_CND(
+            handle->ops_queue.len > 0, handle->tracer, "process ops queue,#009BC2FF", "clh.worker",
+            "node = %d\nqueue size = %ld", clh_node_id(handle), handle->ops_queue.len)
         {
             assert(process_ops_queue_(handle) == CLH_STATUS_SUCCESS);
         }
