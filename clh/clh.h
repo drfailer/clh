@@ -32,6 +32,7 @@ struct CLH_Request {
     bool                    completed;
     CLH_Mutex               mutex;
     CLH_ConditionalVariable cv;
+    clh_u32                 channel;
     union {
         struct {
             bool              result;
