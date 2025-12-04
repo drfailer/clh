@@ -33,14 +33,16 @@ struct CLH_Request {
     CLH_Mutex               mutex;
     CLH_ConditionalVariable cv;
     clh_u32                 channel;
+    clh_i32                 source;
+    clh_u32                 tag;
     union {
         struct {
             bool              result;
             bool              remove;
             clh_u64           tag;
             clh_u64           tag_mask;
-            size_t            buffer_len;
             clh_u64           sender_tag;
+            size_t            buffer_len;
             ucp_tag_message_h msg;
         } probe;
         struct {
@@ -49,10 +51,11 @@ struct CLH_Request {
             clh_u32    dest;
         } send;
         struct {
-            CLH_Buffer        buffer;
-            clh_u64           tag;
-            clh_u64           tag_mask;
-            ucp_tag_message_h msg;
+            CLH_Buffer          buffer;
+            clh_u64             tag;
+            clh_u64             tag_mask;
+            ucp_tag_recv_info_t infos;
+            ucp_tag_message_h   msg;
         } recv;
     } data;
 };
@@ -132,7 +135,9 @@ void         clh_request_release(CLH_Handle handle, CLH_Request *request);
 
 bool    clh_request_completed(CLH_Handle handle, CLH_Request *request);
 size_t  clh_request_buffer_len(CLH_Request *request);
-clh_u64 clh_request_tag(CLH_Request *request);
+clh_u32 clh_request_channel(CLH_Request *request);
+clh_i32 clh_request_source(CLH_Request *request);
+clh_u32 clh_request_tag(CLH_Request *request);
 
 void    clh_barrier(CLH_Handle handle);
 clh_i32 clh_node_id(CLH_Handle handle);

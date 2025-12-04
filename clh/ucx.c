@@ -178,12 +178,14 @@ ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_mem_h mem
 {
     ucp_request_param_t params = {
         .op_attr_mask
-        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
+        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL
+        | UCP_OP_ATTR_FIELD_RECV_INFO,
         .datatype = ucp_dt_make_contig(1),
         .memh = memh,
     };
     ucs_status_ptr_t status;
 
+    params.recv_info.tag_info = &request->data.recv.infos;
     if (request->data.recv.msg != NULL) {
         status
             = ucp_tag_msg_recv_nbx(handle->worker, request->data.recv.buffer.mem,

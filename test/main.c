@@ -14,19 +14,22 @@ int main(int, char **)
 
     if (clh_node_id(clh) == 0) {
         for (size_t i = 1; i < clh_nb_nodes(clh); ++i) {
-            CLH_Request *request = clh_recv(clh, 0, 0, 0, (CLH_Buffer){message, 1024});
-            // CLH_Request *request = clh_recv_from(clh, 0, i, 0, 0, (CLH_Buffer){message, 1024});
+            CLH_Request *request = clh_recv(clh, 1, 0, 0, (CLH_Buffer){message, 1024});
+            // CLH_Request *request = clh_recv_from(clh, 1, i, 0, 0, (CLH_Buffer){message, 1024});
             assert(request);
             TRACER_LOCAL_REGION(clh->tracer, "recv wait,#FF0000FF", "main")
             {
                 clh_wait(clh, request);
             }
-            printf("message received: `%s`\n", message);
+            assert(request->tag == 0);
+            assert(request->channel == 1);
+            // assert(request->source == i); // for clh_recv_from
+            printf("message received: `%s` (source = %d)\n", message, request->source);
             clh_request_release(clh, request);
         }
     } else {
         sprintf(message, "Hello from rank = %d", clh_node_id(clh));
-        CLH_Request *request = clh_send(clh, 0, 0, 0, (CLH_Buffer){message, strlen(message) + 1});
+        CLH_Request *request = clh_send(clh, 1, 0, 0, (CLH_Buffer){message, strlen(message) + 1});
         assert(request);
         TRACER_LOCAL_REGION(clh->tracer, "send wait,#00FF00FF", "main")
         {
