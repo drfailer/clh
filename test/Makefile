@@ -20,6 +20,7 @@ memcheck: prog
 		--suppressions=/usr/lib/x86_64-linux-gnu/pmix2/share/pmix/pmix-valgrind.supp \
 		--leak-check=full \
 		--track-origins=yes \
+		--show-leak-kinds=all \
 		prog
 
 clean:
