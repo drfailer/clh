@@ -28,9 +28,14 @@ void clh_list_init_(CLH_List *list, struct CLH_ListInitArgs *args)
 void clh_list_destroy(CLH_List *list)
 {
     CLH_ListNode *cur = NULL, *next = NULL;
+    size_t non_free_count = 0;
     for (cur = list->head; cur != NULL; cur = next) {
+        ++non_free_count;
         next = cur->next;
         clh_allocator_free(list->allocator, cur);
+    }
+    if (non_free_count > 0) {
+        clh_warning("MEM", "%ld requests where not released.", non_free_count);
     }
     for (cur = list->free_nodes; cur != NULL; cur = next) {
         next = cur->next;

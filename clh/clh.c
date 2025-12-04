@@ -84,6 +84,7 @@ CLH_Status clh_init(CLH_Handle *handle)
 #ifdef CONF_WARMUP_LOOP_COUNT
     TRACER_DISABLE((*handle)->tracer);
     clh_warmup_(*handle);
+    clh_barrier(*handle);
     TRACER_ENABLE((*handle)->tracer);
 #endif
     return CLH_STATUS_SUCCESS;
@@ -168,7 +169,7 @@ static CLH_ListNode *message_search(CLH_List *list, clh_u64 tag, clh_u64 tag_mas
     {
         clh_list_foreach(CLH_Message, msg, list)
         {
-            if ((msg->sender_tag & tag_mask) == (tag & tag_mask)) {
+            if ((msg->full_tag & tag_mask) == (tag & tag_mask)) {
                 result = msg_cur;
                 break;
             }
@@ -244,7 +245,7 @@ static CLH_Status process_recv_queue_(CLH_Handle handle)
             }
         }
         if (op.request->data.recv.msg == NULL) {
-            CLH_Request *request = (CLH_Request *)cur->data;
+            CLH_Request  *request = (CLH_Request *)cur->data;
             CLH_ListNode *node
                 = message_search(&handle->recv_list[op.request->channel], request->data.recv.tag,
                                  request->data.recv.tag_mask);
@@ -326,6 +327,7 @@ static void probe_incomming_messages_(CLH_Handle handle)
         if (msg.msg == NULL) {
             break;
         }
+        msg.full_tag = infos.sender_tag;
         clh_decode_tag(infos.sender_tag, &msg.channel, &msg.sender_id, &msg.sender_tag);
         msg.buffer_len = infos.length;
         clh_list_push_data(&handle->recv_list[msg.channel], &msg);
@@ -444,7 +446,7 @@ static CLH_Status clh_warmup_(CLH_Handle handle)
             CLH_Buffer send_buf = {send_mem, WARMUP_MSG_SIZE},
                        recv_buf = {recv_mem.ptr[idx].str, WARMUP_MSG_SIZE};
             send_requests.ptr[idx] = clh_send(handle, 0, rank, 0, send_buf);
-            recv_requests.ptr[idx] = clh_recv(handle, 0, rank, 0, 0xFFFFFFFF, recv_buf);
+            recv_requests.ptr[idx] = clh_recv_from(handle, 0, rank, 0, 0xFFFFFFFF, recv_buf);
         }
     }
 
@@ -468,7 +470,11 @@ static CLH_Status clh_warmup_(CLH_Handle handle)
             snprintf(expected_response, WARMUP_MSG_SIZE, "warmup send from %ld", rank);
             clh_wait(handle, recv_requests.ptr[idx]);
             clh_request_release(handle, recv_requests.ptr[idx]);
-            assert(strcmp(expected_response, recv_mem.ptr[idx].str) == 0);
+            if (strcmp(expected_response, recv_mem.ptr[idx].str) != 0) {
+                printf("received: %s, expect: %s, cmp = %d\n", recv_mem.ptr[idx].str, expected_response,
+                        strcmp(expected_response, recv_mem.ptr[idx].str));
+                assert(false && "warmup test failed.");
+            }
         }
     }
 
@@ -495,7 +501,6 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 channel, clh_u32 dest, clh_u32 
     request->completed = false;
     request->channel = channel;
     request->data.send.buffer = buffer;
-    // TODO: add channel and source to the tag
     request->data.send.tag = clh_encode_tag(channel, clh_node_id(handle), tag);
     request->data.send.dest = dest;
     TRACER_LOCAL_REGION(handle->tracer, "send,#00990CFF", "clh.op",
@@ -510,8 +515,8 @@ CLH_Request *clh_send(CLH_Handle handle, clh_u32 channel, clh_u32 dest, clh_u32 
 
 // recv ////////////////////////////////////////////////////////////////////////
 
-CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u32 tag,
-                      clh_u32 tag_mask, CLH_Buffer buffer)
+static CLH_Request *clh_recv_(CLH_Handle handle, clh_u32 channel, clh_u64 tag, clh_u64 tag_mask,
+                              CLH_Buffer buffer)
 {
     CLH_ListNode *node = clh_list_new_node(&handle->request_queues[CLH_REQUEST_TYPE_RECV]);
     CLH_Request  *request = (CLH_Request *)node->data;
@@ -520,8 +525,7 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u3
     request->completed = false;
     request->channel = channel;
     request->data.recv.buffer = buffer;
-    // TODO: add channel and source to the tag
-    request->data.recv.tag = clh_encode_tag(channel, source, tag);
+    request->data.recv.tag = tag;
     request->data.recv.tag_mask = tag_mask;
     request->data.recv.msg = NULL;
     TRACER_LOCAL_REGION(handle->tracer, "recv,#F5E900FF", "clh.op",
@@ -532,6 +536,22 @@ CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u3
         WORKER_SIGNAL(handle);
     }
     return request;
+}
+
+CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 tag, clh_u32 tag_mask,
+                      CLH_Buffer buffer)
+{
+    clh_u64 clh_tag = clh_encode_tag(channel, 0, tag);
+    clh_u64 clh_tag_mask = CHANNEL_MASK | (clh_u64)tag_mask;
+    return clh_recv_(handle, channel, clh_tag, clh_tag_mask, buffer);
+}
+
+CLH_Request *clh_recv_from(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u32 tag,
+                           clh_u32 tag_mask, CLH_Buffer buffer)
+{
+    clh_u64 clh_tag = clh_encode_tag(channel, source, tag);
+    clh_u64 clh_tag_mask = CHANNEL_MASK | SENDER_ID_MASK | (clh_u64)tag_mask;
+    return clh_recv_(handle, channel, clh_tag, clh_tag_mask, buffer);
 }
 
 CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *request, CLH_Buffer buffer)

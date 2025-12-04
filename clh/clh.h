@@ -75,6 +75,7 @@ typedef struct {
     clh_u32           channel;
     clh_i32           sender_id;
     clh_u32           sender_tag;
+    clh_u64           full_tag;
     clh_u64           buffer_len;
     ucp_tag_message_h msg;
 } CLH_Message;
@@ -113,8 +114,10 @@ CLH_Status clh_finalize(CLH_Handle handle);
 
 CLH_Request *clh_send(CLH_Handle handle, clh_u32 channel, clh_u32 dest, clh_u32 tag,
                       CLH_Buffer buffer);
-CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u32 tag,
-                      clh_u32 tag_mask, CLH_Buffer buffer);
+CLH_Request *clh_recv(CLH_Handle handle, clh_u32 channel, clh_u32 tag, clh_u32 tag_mask,
+                      CLH_Buffer buffer);
+CLH_Request *clh_recv_from(CLH_Handle handle, clh_u32 channel, clh_u32 source, clh_u32 tag,
+                           clh_u32 tag_mask, CLH_Buffer buffer);
 CLH_Request *clh_request_recv(CLH_Handle handle, CLH_Request *probe_request, CLH_Buffer buf);
 CLH_Request *clh_probe(CLH_Handle handle, clh_u32 channel, clh_u32 tag, clh_u32 tag_mask,
                        bool remove);

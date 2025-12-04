@@ -3,6 +3,7 @@
 #include "clh_defs.h"
 #include "mem.h"
 #include "thread.h"
+#include "log.h"
 #include <stdbool.h>
 
 typedef struct CLH_ListNode {

@@ -14,7 +14,8 @@ int main(int, char **)
 
     if (clh_node_id(clh) == 0) {
         for (size_t i = 1; i < clh_nb_nodes(clh); ++i) {
-            CLH_Request *request = clh_recv(clh, 0, i, 0, 0, (CLH_Buffer){message, 1024});
+            CLH_Request *request = clh_recv(clh, 0, 0, 0, (CLH_Buffer){message, 1024});
+            // CLH_Request *request = clh_recv_from(clh, 0, i, 0, 0, (CLH_Buffer){message, 1024});
             assert(request);
             TRACER_LOCAL_REGION(clh->tracer, "recv wait,#FF0000FF", "main")
             {
