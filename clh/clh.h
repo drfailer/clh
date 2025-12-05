@@ -138,6 +138,7 @@ size_t  clh_request_buffer_len(CLH_Request *request);
 clh_u32 clh_request_channel(CLH_Request *request);
 clh_i32 clh_request_source(CLH_Request *request);
 clh_u32 clh_request_tag(CLH_Request *request);
+bool clh_probe_result(CLH_Request *request);
 
 void    clh_barrier(CLH_Handle handle);
 clh_i32 clh_node_id(CLH_Handle handle);

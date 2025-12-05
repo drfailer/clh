@@ -292,7 +292,7 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
     size_t   idx = 0;
 
     while (idx < queue->len) {
-        CLH_Op *op = &queue->ptr[idx];
+        CLH_Op      *op = &queue->ptr[idx];
         ucs_status_t status;
 
         assert(UCS_PTR_IS_PTR(op->status_ptr) && !UCS_PTR_IS_ERR(op->status_ptr));
@@ -308,8 +308,8 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
             CLH_Request *request = op->request;
 
             if (request->type == CLH_REQUEST_TYPE_RECV) {
-                clh_decode_tag(request->data.recv.infos.sender_tag,
-                        &request->channel, &request->source, &request->tag);
+                clh_decode_tag(request->data.recv.infos.sender_tag, &request->channel,
+                               &request->source, &request->tag);
             }
             ucp_request_free(op->status_ptr);
             array_remove(handle->ops_queue, idx);
@@ -484,8 +484,8 @@ static CLH_Status clh_warmup_(CLH_Handle handle)
             clh_wait(handle, recv_requests.ptr[idx]);
             clh_request_release(handle, recv_requests.ptr[idx]);
             if (strcmp(expected_response, recv_mem.ptr[idx].str) != 0) {
-                printf("received: %s, expect: %s, cmp = %d\n", recv_mem.ptr[idx].str, expected_response,
-                        strcmp(expected_response, recv_mem.ptr[idx].str));
+                printf("received: %s, expect: %s, cmp = %d\n", recv_mem.ptr[idx].str,
+                       expected_response, strcmp(expected_response, recv_mem.ptr[idx].str));
                 assert(false && "warmup test failed.");
             }
         }
@@ -692,17 +692,6 @@ static void clh_request_free_(void *, void *ptr)
     free(node);
 }
 
-// CLH_Request *clh_request_get(CLH_Handle handle)
-// {
-//     CLH_Request *request = NULL;
-//
-//     CLH_LOCK_REGION(handle->request_pool.mutex)
-//     {
-//         request = (CLH_Request *)clh_dyn_mem_pool_alloc(&handle->request_pool.pool);
-//     }
-//     return request;
-// }
-
 void clh_request_release(CLH_Handle handle, CLH_Request *request)
 {
     clh_list_release_data(&handle->request_queues[request->type], request);
@@ -726,6 +715,11 @@ clh_i32 clh_request_source(CLH_Request *request)
 clh_u32 clh_request_tag(CLH_Request *request)
 {
     return request->tag;
+}
+
+bool clh_probe_result(CLH_Request *request)
+{
+    return request->data.probe.result;
 }
 
 /******************************************************************************/
