@@ -2,7 +2,7 @@
 #define CLH_PMI
 #include "clh_defs.h"
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -30,7 +30,7 @@ char *clh_pmi_make_value(char *mem, size_t len);
 clh_u32 clh_pmi_nb_nodes(CLH_PMI_Handle pmi);
 clh_i32 clh_pmi_node_id(CLH_PMI_Handle pmi);
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 

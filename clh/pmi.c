@@ -37,17 +37,20 @@ CLH_PMI_Status clh_pmi_init(CLH_PMI_Handle *pmi)
         return CLH_PMI_STATUS_ERROR;
     }
     pmi_->nb_nodes = value->data.uint32;
-    PMIX_VALUE_RELEASE(value);
-
+    PMIX_VALUE_DESTRUCT(value);
     return CLH_PMI_STATUS_SUCCESS;
 }
 
 CLH_PMI_Status clh_pmi_finalize(CLH_PMI_Handle pmi)
 {
+    struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
+
+    PMIX_PROC_DESTRUCT(&pmi_->proc);
+    PMIX_PROC_DESTRUCT(&pmi_->proc_wild);
     if (!check_pmi(PMIx_Finalize(NULL, 0))) {
         return CLH_PMI_STATUS_ERROR;
     }
-    free(pmi);
+    free(pmi_);
     return CLH_PMI_STATUS_SUCCESS;
 }
 
@@ -69,17 +72,16 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
 {
     struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
     pmix_value_t *pmi_value = NULL;
-    pmix_proc_t   proc = {};
 
-    PMIX_LOAD_PROCID(&proc, pmi_->proc.nspace, node_id);
-    if (!check_pmi(PMIx_Get(&proc, key, NULL, 0, &pmi_value))) {
+    PMIX_LOAD_PROCID(&pmi_->proc, pmi_->proc.nspace, node_id);
+    if (!check_pmi(PMIx_Get(&pmi_->proc, key, NULL, 0, &pmi_value))) {
         return CLH_PMI_STATUS_ERROR;
     }
     memcpy(value, pmi_value->data.bo.bytes, pmi_value->data.bo.size);
     if (size) {
         *size = pmi_value->data.bo.size;
     }
-    PMIX_VALUE_RELEASE(pmi_value);
+    PMIX_VALUE_DESTRUCT(pmi_value);
 
     return CLH_PMI_STATUS_SUCCESS;
 }
@@ -87,11 +89,11 @@ CLH_PMI_Status clh_pmi_get(CLH_PMI_Handle pmi, clh_i32 node_id, char const *key,
 CLH_PMI_Status clh_pmi_fence(CLH_PMI_Handle pmi)
 {
     struct CLH_PMI_Handle *pmi_ = (struct CLH_PMI_Handle*)pmi;
-    pmix_info_t *info = NULL;
-    bool         collect_data = false;
-
+    pmix_info_t* info;
     PMIX_INFO_CREATE(info, 1);
-    PMIX_INFO_LOAD(info, PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
+    bool        collect_data = false;
+
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
     if (!check_pmi(PMIx_Fence(&pmi_->proc_wild, 1, info, 1))) {
         return CLH_PMI_STATUS_ERROR;
     }
@@ -108,10 +110,11 @@ CLH_PMI_Status clh_pmi_sync(CLH_PMI_Handle pmi)
         return CLH_PMI_STATUS_ERROR;
     }
 
-    pmix_info_t *info = NULL;
+    pmix_info_t* info;
     PMIX_INFO_CREATE(info, 1);
     bool collect_data = true;
-    PMIX_INFO_LOAD(info, PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
+
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &collect_data, PMIX_BOOL);
     if (!check_pmi(PMIx_Fence(&pmi_->proc_wild, 1, info, 1))) {
         return CLH_PMI_STATUS_ERROR;
     }

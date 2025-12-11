@@ -2,7 +2,7 @@
 #define CLH_BUFFER
 #include "clh_defs.h"
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
 
@@ -21,7 +21,7 @@ CLH_Buffer clh_buf_create(size_t len);
 CLH_BufferBuilder clh_bb_create(CLH_Buffer *buffer);
 bool              clh_bb_append(CLH_BufferBuilder *bb, ucp_byte *data, size_t count);
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(c_plusplus)
 }
 #endif
 
