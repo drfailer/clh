@@ -1,5 +1,5 @@
-#include "ucx.h"
 #include "log.h"
+#include "ucx.h"
 
 static void failure_handler(void *request, ucp_ep_h ep, ucs_status_t status)
 {
@@ -49,7 +49,10 @@ static inline CLH_Status init_ucp_endpoints_(CLH_Handle handle)
     size_t nb_nodes = clh_nb_nodes(handle);
     char  *key = clh_pmi_make_key(this_node_id);
     char  *value = clh_pmi_make_value((char *)handle->address.data, handle->address.len);
-    clh_pmi_put(handle->pmi, key, value, handle->address.len);
+    if (clh_pmi_put(handle->pmi, key, value, handle->address.len) != CLH_PMI_STATUS_SUCCESS) {
+        clh_error("PMI", "%d failed to put his address on PMI data base.", this_node_id);
+        return CLH_STATUS_ERROR;
+    }
     clh_pmi_sync(handle->pmi);
 
     handle->endpoints = malloc(nb_nodes * sizeof(ucp_ep_h));
@@ -62,6 +65,11 @@ static inline CLH_Status init_ucp_endpoints_(CLH_Handle handle)
 
         key = clh_pmi_make_key(node_id);
         clh_pmi_get(handle->pmi, node_id, key, peer_addr, NULL);
+        if (clh_pmi_get(handle->pmi, node_id, key, peer_addr, NULL) != CLH_PMI_STATUS_SUCCESS) {
+            clh_error("PMI", "process %d failed to get %ld address from PMI data base.",
+                      this_node_id, node_id);
+            return CLH_STATUS_ERROR;
+        }
 
         ucp_ep_params_t ep_params = {
             .field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS | UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE
@@ -72,6 +80,8 @@ static inline CLH_Status init_ucp_endpoints_(CLH_Handle handle)
             .err_handler.arg = NULL,
         };
         if (!check_ucx(ucp_ep_create(handle->worker, &ep_params, &handle->endpoints[node_id]))) {
+            clh_error("UCX", "could not create enpoint from process %d to %ld.", this_node_id,
+                      node_id);
             return CLH_STATUS_ERROR;
         }
     }
@@ -91,19 +101,19 @@ CLH_Status ucx_init(CLH_Handle handle)
 {
     CLH_Status status = CLH_STATUS_SUCCESS;
     if ((status = init_ucp_context_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp context.\n");
+        clh_error("UCX", "%s", "failed to init ucp context.");
         return status;
     }
     if ((status = init_ucp_worker_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp worker.\n");
+        clh_error("UCX", "%s", "failed to create ucp worker.");
         return status;
     }
     if ((status = init_ucp_endpoints_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init ucp endpoints.\n");
+        clh_error("UCX", "%s", "failed to init ucp endpoints.");
         return status;
     }
     if ((status = init_cache_(handle)) != CLH_STATUS_SUCCESS) {
-        fprintf(stderr, "error: init cache.\n");
+        clh_error("UCX", "%s", "failed to init cache.");
         return status;
     }
     return status;
@@ -177,9 +187,8 @@ ucs_status_ptr_t ucx_send(CLH_Handle handle, CLH_Request *request, ucp_mem_h mem
 ucs_status_ptr_t ucx_recv(CLH_Handle handle, CLH_Request *request, ucp_mem_h memh)
 {
     ucp_request_param_t params = {
-        .op_attr_mask
-        = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_NO_IMM_CMPL
-        | UCP_OP_ATTR_FIELD_RECV_INFO,
+        .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_MEMH
+                        | UCP_OP_ATTR_FLAG_NO_IMM_CMPL | UCP_OP_ATTR_FIELD_RECV_INFO,
         .datatype = ucp_dt_make_contig(1),
         .memh = memh,
     };
