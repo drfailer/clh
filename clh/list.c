@@ -71,6 +71,10 @@ void clh_list_push_node(CLH_List *list, CLH_ListNode *node)
 CLH_ListNode *clh_list_pop_node(CLH_List *list)
 {
     CLH_ListNode *node = NULL;
+
+    if (list->tail == 0) {
+        return node;
+    }
     CLH_LOCK_REGION(list->mutex)
     {
         node = list->tail;
@@ -78,6 +82,7 @@ CLH_ListNode *clh_list_pop_node(CLH_List *list)
 
         if (node->prev != NULL) {
             node->prev->next = NULL;
+            node->prev = NULL;
         } else {
             assert(list->head == node);
             list->head = node->next;

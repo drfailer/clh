@@ -19,7 +19,7 @@ static void  clh_request_free_(void *, void *ptr);
 #define CONF_WARMUP_LOOP_COUNT 10
 #define CONF_PROGRESS_COUNT 1
 #define CONF_PROBE_THRESH 1
-// #define CONF_SEND_THRESH 32
+#define CONF_SEND_THRESH 1024
 
 #ifdef CONF_WORKER_WAIT
 #define WORKER_WAIT(handle)                  \
@@ -178,17 +178,53 @@ static CLH_ListNode *message_search(CLH_List *list, clh_u64 tag, clh_u64 tag_mas
     return result;
 }
 
+#ifdef CONF_SEND_THRESH
+static CLH_Status process_send_queue_(CLH_Handle handle)
+{
+    CLH_Status           status = CLH_STATUS_SUCCESS;
+    CLH_BufferCacheEntry bce;
+    CLH_ListNode        *node = NULL;
+
+    if (handle->request_queues[CLH_REQUEST_TYPE_SEND].head == NULL) {
+        return status;
+    }
+
+    while (handle->send_count < CONF_SEND_THRESH) {
+        node = clh_list_pop_node(&handle->request_queues[CLH_REQUEST_TYPE_SEND]);
+        if (node == NULL) {
+            break;
+        }
+
+        CLH_Op op = {.request = (CLH_Request *)node->data, .status_ptr = NULL};
+        TRACER_LOCAL_REGION(handle->tracer, "register", "clh.cache")
+        {
+            bce = clh_buffer_cache_register_or_get(handle->buffer_cache,
+                                                   op.request->data.send.buffer);
+            if (bce.mem != op.request->data.send.buffer.mem) {
+                clh_info("UCX", "bce.mem = %p, buffer.mem = %p", bce.mem,
+                         op.request->data.send.buffer.mem);
+                clh_error("UCX", "%s", "registration error.");
+                return CLH_STATUS_MEMORY_REGISTRATION_ERROR;
+            }
+        }
+        TRACER_LOCAL_REGION(handle->tracer, "ucx_send", "clh.ucx")
+        {
+            op.status_ptr = ucx_send(handle, op.request, bce.memh);
+        }
+        if (!validate_status_ptr_(handle, &op)) {
+            clh_error("UCX", "%s", "send request failure.");
+            return CLH_STATUS_REQUEST_FAILURE;
+        }
+        handle->send_count += 1;
+    }
+    return status;
+}
+#else
 static CLH_Status process_send_queue_(CLH_Handle handle)
 {
     CLH_Status           status = CLH_STATUS_SUCCESS;
     CLH_BufferCacheEntry bce;
     CLH_ListNode        *begin = NULL, *end = NULL, *cur = NULL;
-
-#ifdef CONF_SEND_THRESH
-    if (handle->ops_queue.len > CONF_SEND_THRESH) {
-        return status;
-    }
-#endif
 
     if (handle->request_queues[CLH_REQUEST_TYPE_SEND].head == NULL) {
         return status;
@@ -219,6 +255,7 @@ static CLH_Status process_send_queue_(CLH_Handle handle)
     }
     return status;
 }
+#endif
 
 static CLH_Status process_recv_queue_(CLH_Handle handle)
 {
@@ -313,6 +350,11 @@ static CLH_Status process_ops_queue_(CLH_Handle handle)
             }
             ucp_request_free(op->status_ptr);
             array_remove(handle->ops_queue, idx);
+#ifdef CONF_SEND_THRESH
+            if (request->type == CLH_REQUEST_TYPE_SEND) {
+                handle->send_count -= 1;
+            }
+#endif
             CLH_COMPLETE_REQUEST(request);
         } else {
             clh_error("UCX", "request error (status = %s)", ucs_status_string(status));
